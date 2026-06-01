@@ -4,11 +4,11 @@ Bundle-Name: EDT Debug Tracer
 Bundle-SymbolicName: com.tracer.edt.debugtracer;singleton:=true
 Bundle-Version: 1.0.0.qualifier
 Bundle-Activator: com.tracer.edt.core.DebugTracerActivator
-Bundle-Vendor: lytkinam
-Require-Bundle: org.eclipse.debug.core,
- org.eclipse.core.runtime,
- com._1c.g5.v8.dt.debug.core;resolution:=optional
 Bundle-RequiredExecutionEnvironment: JavaSE-17
-Bundle-ActivationPolicy: lazy
+Require-Bundle: org.eclipse.debug.core,
+ org.eclipse.core.runtime
+Bundle-ClassPath: .,
+ lib/sqlite-jdbc.jar
 Export-Package: com.tracer.edt.core,
+ com.tracer.edt.db,
  com.tracer.edt.mcp
