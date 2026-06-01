@@ -1,49 +1,59 @@
 package com.tracer.edt.core;
 
 import org.eclipse.debug.core.DebugEvent;
-import org.eclipse.debug.core.DebugException;
 import org.eclipse.debug.core.IDebugEventSetListener;
 import org.eclipse.debug.core.model.IStackFrame;
 import org.eclipse.debug.core.model.IThread;
 
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 /**
- * Listens to Eclipse debug events.
- * On SUSPEND + STEP_END or BREAKPOINT: reads top stack frame and writes a TraceEntry to buffer.
+ * Listens to Eclipse Debug events. On each SUSPEND extracts the top BSL stack frame
+ * and enqueues a TraceEntry. Must be fast - no blocking I/O.
  */
 public class DebugTracerListener implements IDebugEventSetListener {
 
-    private final StepLogBuffer buffer;
+    // EDT frame name format: "ProcedureName line: 42" or just "ProcedureName"
+    private static final Pattern FRAME_PATTERN = Pattern.compile("^(.+?)\\s+line:\\s*(\\d+)$");
 
-    public DebugTracerListener(StepLogBuffer buffer) {
-        this.buffer = buffer;
+    private final AsyncTraceWriter writer;
+    private final TraceSessionManager sessionManager;
+
+    public DebugTracerListener(AsyncTraceWriter writer, TraceSessionManager sessionManager) {
+        this.writer = writer;
+        this.sessionManager = sessionManager;
     }
 
     @Override
     public void handleDebugEvents(DebugEvent[] events) {
-        if (!buffer.isRecording()) return;
+        String sessionId = sessionManager.getActiveSessionId();
+        if (sessionId == null) return;
 
         for (DebugEvent event : events) {
             if (event.getKind() != DebugEvent.SUSPEND) continue;
-            // Обрабатываем: шаг завершён или точка останова
-            int detail = event.getDetail();
-            if (detail != DebugEvent.STEP_END && detail != DebugEvent.BREAKPOINT) continue;
+            if (!(event.getSource() instanceof IThread thread)) continue;
 
-            Object source = event.getSource();
-            if (!(source instanceof IThread)) continue;
-
-            IThread thread = (IThread) source;
             try {
                 IStackFrame frame = thread.getTopStackFrame();
                 if (frame == null) continue;
 
-                TraceEntry entry = new TraceEntry(
-                    frame.getName(),
-                    frame.getLineNumber(),
-                    thread.getName()
-                );
-                buffer.add(entry);
-            } catch (DebugException e) {
-                // Молча пропускаем — не критично потерять одну запись
+                String name = frame.getName();
+                int line = frame.getLineNumber();
+                String procedure = name;
+
+                Matcher m = FRAME_PATTERN.matcher(name);
+                if (m.matches()) {
+                    procedure = m.group(1).trim();
+                    try { line = Integer.parseInt(m.group(2)); } catch (NumberFormatException ignore) {}
+                }
+
+                long threadId = 0;
+                try { threadId = Long.parseLong(thread.getName()); } catch (Exception ignore) {}
+
+                writer.enqueue(sessionId, new TraceEntry(procedure, line, "main", threadId));
+            } catch (Exception e) {
+                // Suppress - never crash the debug thread
             }
         }
     }

@@ -1,38 +1,50 @@
 package com.tracer.edt.core;
 
-import java.time.Instant;
-
 /**
- * One trace record: module/procedure name, line number, thread name, timestamp.
+ * A single raw BSL execution step: procedure name, line, module, thread.
  */
 public class TraceEntry {
 
-    private final String procedure;   // frame name (module.procedure)
-    private final int    line;
-    private final String thread;
-    private final Instant timestamp;
+    private final String procedure;
+    private final int line;
+    private final String module;
+    private final long threadId;
+    private final long ts;
 
-    public TraceEntry(String procedure, int line, String thread) {
+    public TraceEntry(String procedure, int line, String module, long threadId) {
         this.procedure = procedure;
-        this.line      = line;
-        this.thread    = thread;
-        this.timestamp = Instant.now();
+        this.line = line;
+        this.module = module;
+        this.threadId = threadId;
+        this.ts = System.currentTimeMillis();
     }
 
-    public String getProcedure()  { return procedure; }
-    public int    getLine()       { return line; }
-    public String getThread()     { return thread; }
-    public Instant getTimestamp() { return timestamp; }
+    /** For tests: explicit timestamp */
+    public TraceEntry(String procedure, int line, String module, long threadId, long ts) {
+        this.procedure = procedure;
+        this.line = line;
+        this.module = module;
+        this.threadId = threadId;
+        this.ts = ts;
+    }
 
-    /** Simple JSON serialization (no external deps). */
+    public String getProcedure() { return procedure; }
+    public int getLine() { return line; }
+    public String getModule() { return module; }
+    public long getThreadId() { return threadId; }
+    public long getTs() { return ts; }
+
     public String toJson() {
-        return String.format(
-            "{\"procedure\":\"%s\",\"line\":%d,\"thread\":\"%s\",\"timestamp\":\"%s\"}",
-            escape(procedure), line, escape(thread), timestamp.toString()
-        );
+        return "{\"procedure\":\"" + esc(procedure) + "\""
+            + ",\"line\":" + line
+            + ",\"module\":\"" + esc(module) + "\""
+            + ",\"thread_id\":" + threadId
+            + ",\"ts\":" + ts + "}";
     }
 
-    private static String escape(String s) {
+    private static String esc(String s) {
         return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
+
+    @Override public String toString() { return procedure + ":" + line + " [" + module + "]"; }
 }

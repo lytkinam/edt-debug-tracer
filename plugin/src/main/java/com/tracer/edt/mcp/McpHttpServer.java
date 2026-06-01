@@ -1,117 +1,173 @@
 package com.tracer.edt.mcp;
 
+import com.tracer.edt.core.*;
+import com.tracer.edt.db.TraceRepository;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-import com.tracer.edt.core.StepLogBuffer;
-import com.tracer.edt.core.TraceEntry;
 
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.sql.SQLException;
 import java.util.List;
+import java.util.logging.Logger;
 
 /**
- * Minimal HTTP server exposing the MCP API on localhost.
- *
- * Endpoints:
- *   GET  /mcp/health   — liveness check
- *   GET  /mcp/status   — tracing state
- *   POST /mcp/start    — begin trace session
- *   POST /mcp/stop     — end session, return JSON trace log
+ * Minimal HTTP server exposing the MCP API on localhost:18080.
+ * Uses built-in com.sun.net.httpserver (no extra dependencies).
  */
 public class McpHttpServer {
 
-    private final int           port;
-    private final StepLogBuffer buffer;
-    private       HttpServer    server;
+    private static final Logger LOG = Logger.getLogger(McpHttpServer.class.getName());
+    private static final String VERSION = "1.0.0";
 
-    public McpHttpServer(int port, StepLogBuffer buffer) {
-        this.port   = port;
-        this.buffer = buffer;
+    private final int port;
+    private final TraceSessionManager sessionManager;
+    private final AsyncTraceWriter writer;
+    private final TraceRepository repo;
+    private HttpServer server;
+
+    public McpHttpServer(int port, TraceSessionManager sm, AsyncTraceWriter writer, TraceRepository repo) {
+        this.port = port;
+        this.sessionManager = sm;
+        this.writer = writer;
+        this.repo = repo;
     }
 
     public void start() throws IOException {
         server = HttpServer.create(new InetSocketAddress("localhost", port), 0);
-        server.createContext("/mcp/health", this::handleHealth);
-        server.createContext("/mcp/status", this::handleStatus);
-        server.createContext("/mcp/start",  this::handleStart);
-        server.createContext("/mcp/stop",   this::handleStop);
-        server.setExecutor(null); // default executor
+        server.createContext("/mcp/health",      this::handleHealth);
+        server.createContext("/mcp/status",      this::handleStatus);
+        server.createContext("/mcp/start",       this::handleStart);
+        server.createContext("/mcp/stop",        this::handleStop);
+        server.createContext("/mcp/postprocess", this::handlePostprocess);
+        server.createContext("/mcp/trace",       this::handleTrace);
+        server.setExecutor(null);
         server.start();
+        LOG.info("MCP HTTP server started on port " + port);
     }
 
     public void stop() {
         if (server != null) server.stop(0);
     }
 
-    // ── Handlers ────────────────────────────────────────────────────────────
+    // --- handlers ---
 
     private void handleHealth(HttpExchange ex) throws IOException {
-        respond(ex, 200, "{\"status\":\"ok\",\"version\":\"1.0.0\"}");
+        respond(ex, 200, "{\"ok\":true,\"version\":\"" + VERSION + "\"}");
     }
 
     private void handleStatus(HttpExchange ex) throws IOException {
-        String sid = buffer.getSessionId();
-        String json = String.format(
-            "{\"tracing\":%b,\"entries_count\":%d,\"session_id\":%s}",
-            buffer.isRecording(),
-            buffer.size(),
-            sid == null ? "null" : "\"" + sid + "\""
-        );
-        respond(ex, 200, json);
+        if (sessionManager.isActive()) {
+            respond(ex, 200, "{\"active\":true,\"session_id\":\"" + sessionManager.getActiveSessionId()
+                + "\",\"steps\":" + sessionManager.getStepCount() + "}");
+        } else {
+            respond(ex, 200, "{\"active\":false}");
+        }
     }
 
     private void handleStart(HttpExchange ex) throws IOException {
-        if (!ex.getRequestMethod().equalsIgnoreCase("POST")) { respond(ex, 405, "{\"error\":\"method_not_allowed\"}"); return; }
-        // Читаем опциональный session_id из тела
-        String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-        String sid  = parseSessionId(body);
-        if (buffer.startSession(sid)) {
-            respond(ex, 200, String.format("{\"started\":true,\"session_id\":%s}",
-                sid == null ? "null" : "\"" + sid + "\""));
-        } else {
-            respond(ex, 409, "{\"error\":\"already_running\",\"message\":\"Tracing session is already active\"}");
+        String body = readBody(ex);
+        String sessionId = extractJsonString(body, "session_id");
+        if (sessionId == null || sessionId.isBlank()) {
+            respond(ex, 400, "{\"error\":\"session_id required\"}");
+            return;
         }
+        if (!sessionManager.start(sessionId)) {
+            respond(ex, 409, "{\"error\":\"session already active\",\"session_id\":\""
+                + sessionManager.getActiveSessionId() + "\"}");
+            return;
+        }
+        try {
+            repo.startSession(sessionId);
+        } catch (SQLException e) {
+            LOG.warning("DB error on start: " + e.getMessage());
+        }
+        respond(ex, 200, "{\"started\":true,\"session_id\":\"" + sessionId + "\"}");
     }
 
     private void handleStop(HttpExchange ex) throws IOException {
-        if (!ex.getRequestMethod().equalsIgnoreCase("POST")) { respond(ex, 405, "{\"error\":\"method_not_allowed\"}"); return; }
-        if (!buffer.isRecording()) {
-            respond(ex, 409, "{\"error\":\"not_running\",\"message\":\"No active tracing session\"}");
-            return;
+        String sessionId = sessionManager.getActiveSessionId();
+        long steps = sessionManager.getStepCount();
+        sessionManager.stop();
+        if (sessionId != null) {
+            try { repo.stopSession(sessionId); } catch (SQLException e) { LOG.warning(e.getMessage()); }
         }
-        String sid     = buffer.getSessionId();
-        List<TraceEntry> entries = buffer.stopSession();
-        StringBuilder sb = new StringBuilder();
-        sb.append("{\"stopped\":true,\"session_id\":");
-        sb.append(sid == null ? "null" : "\"" + sid + "\"");
-        sb.append(",\"entries\":[");
-        for (int i = 0; i < entries.size(); i++) {
-            if (i > 0) sb.append(',');
-            sb.append(entries.get(i).toJson());
-        }
-        sb.append("]}");
-        respond(ex, 200, sb.toString());
+        respond(ex, 200, "{\"stopped\":true,\"session_id\":\""
+            + (sessionId != null ? sessionId : "") + "\",\"steps\":" + steps + "}");
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────────────
+    private void handlePostprocess(HttpExchange ex) throws IOException {
+        String body = readBody(ex);
+        String sessionId = extractJsonString(body, "session_id");
+        if (sessionId == null || sessionId.isBlank()) {
+            respond(ex, 400, "{\"error\":\"session_id required\"}");
+            return;
+        }
+        try {
+            List<TraceEntry> raw = repo.loadRaw(sessionId);
+            List<CollapsedTraceEntry> clean = new LoopCollapser().collapse(raw);
+            repo.replaceClean(sessionId, clean);
+            respond(ex, 200, "{\"ok\":true,\"raw\":" + raw.size() + ",\"clean\":" + clean.size() + "}");
+        } catch (SQLException e) {
+            respond(ex, 500, "{\"error\":\"" + esc(e.getMessage()) + "\"}");
+        }
+    }
 
-    private static void respond(HttpExchange ex, int code, String json) throws IOException {
-        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+    private void handleTrace(HttpExchange ex) throws IOException {
+        String query = ex.getRequestURI().getQuery();
+        String sessionId = getQueryParam(query, "session");
+        String type = getQueryParam(query, "type");
+        if (type == null) type = "clean";
+        if (sessionId == null || sessionId.isBlank()) {
+            respond(ex, 400, "{\"error\":\"session param required\"}");
+            return;
+        }
+        try {
+            String json = repo.traceAsJson(sessionId, type);
+            respond(ex, 200, json);
+        } catch (SQLException e) {
+            respond(ex, 500, "{\"error\":\"" + esc(e.getMessage()) + "\"}");
+        }
+    }
+
+    // --- helpers ---
+
+    private static void respond(HttpExchange ex, int code, String body) throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
         ex.sendResponseHeaders(code, bytes.length);
         try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
     }
 
-    /** Very simple JSON field extractor — avoids external lib dependency. */
-    private static String parseSessionId(String json) {
-        if (json == null || !json.contains("session_id")) return null;
-        int i = json.indexOf("session_id");
-        int colon = json.indexOf(':', i);
+    private static String readBody(HttpExchange ex) throws IOException {
+        try (InputStream is = ex.getRequestBody()) { return new String(is.readAllBytes(), StandardCharsets.UTF_8); }
+    }
+
+    private static String extractJsonString(String json, String key) {
+        if (json == null) return null;
+        String search = "\"" + key + "\"";
+        int idx = json.indexOf(search);
+        if (idx < 0) return null;
+        int colon = json.indexOf(':', idx + search.length());
         if (colon < 0) return null;
-        int start = json.indexOf('"', colon);
-        int end   = json.indexOf('"', start + 1);
-        if (start < 0 || end < 0) return null;
-        return json.substring(start + 1, end);
+        int q1 = json.indexOf('"', colon + 1);
+        if (q1 < 0) return null;
+        int q2 = json.indexOf('"', q1 + 1);
+        if (q2 < 0) return null;
+        return json.substring(q1 + 1, q2);
+    }
+
+    private static String getQueryParam(String query, String key) {
+        if (query == null) return null;
+        for (String part : query.split("&")) {
+            String[] kv = part.split("=", 2);
+            if (kv.length == 2 && kv[0].equals(key)) return kv[1];
+        }
+        return null;
+    }
+
+    private static String esc(String s) {
+        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 }

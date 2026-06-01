@@ -1,0 +1,12 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Name: EDT Debug Tracer Tests
+Bundle-SymbolicName: com.tracer.edt.debugtracer.tests
+Bundle-Version: 1.0.0.qualifier
+Bundle-RequiredExecutionEnvironment: JavaSE-17
+Require-Bundle: com.tracer.edt.debugtracer,
+ org.eclipse.debug.core,
+ org.eclipse.core.runtime,
+ org.junit;bundle-version="4.13.0"
+Bundle-ClassPath: .,
+ lib/sqlite-jdbc.jar
