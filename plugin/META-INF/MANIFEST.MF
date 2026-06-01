@@ -1,16 +1,12 @@
 Manifest-Version: 1.0
 Bundle-ManifestVersion: 2
-Bundle-Name: EDT Debug Tracer
-Bundle-SymbolicName: com.tracer.edt.debugtracer;singleton:=true
+Bundle-Name: Plugin17-test
+Bundle-SymbolicName: plugin17-test
 Bundle-Version: 1.0.0.qualifier
-Bundle-Activator: com.tracer.edt.core.DebugTracerActivator
+Bundle-Activator: plugin17.test.TestActivator
+Automatic-Module-Name: plugin17.test
 Bundle-RequiredExecutionEnvironment: JavaSE-17
-Require-Bundle: org.eclipse.debug.core,
- org.eclipse.core.runtime
-Bundle-ClassPath: .,
- lib/sqlite-jdbc.jar
-Export-Package: com.tracer.edt.core,
- com.tracer.edt.db,
- com.tracer.edt.debug,
- com.tracer.edt.mcp,
- com.tracer.edt.mcp.dto
+Require-Bundle: org.eclipse.core.runtime,
+ org.eclipse.debug.core
+Import-Package: org.junit;version="4.13.0";resolution:=optional,
+ org.junit.runner;version="4.13.0";resolution:=optional
