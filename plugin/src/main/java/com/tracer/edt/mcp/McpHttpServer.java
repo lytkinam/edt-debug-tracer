@@ -25,13 +25,15 @@ public class McpHttpServer {
     private final TraceSessionManager sessionManager;
     private final AsyncTraceWriter writer;
     private final TraceRepository repo;
+    private final McpJsonRpcHandler rpcHandler;
     private HttpServer server;
 
-    public McpHttpServer(int port, TraceSessionManager sm, AsyncTraceWriter writer, TraceRepository repo) {
+    public McpHttpServer(int port, TraceSessionManager sm, AsyncTraceWriter writer, TraceRepository repo, McpJsonRpcHandler rpcHandler) {
         this.port = port;
         this.sessionManager = sm;
         this.writer = writer;
         this.repo = repo;
+        this.rpcHandler = rpcHandler;
     }
 
     public void start() throws IOException {
@@ -42,6 +44,10 @@ public class McpHttpServer {
         server.createContext("/mcp/stop",        this::handleStop);
         server.createContext("/mcp/postprocess", this::handlePostprocess);
         server.createContext("/mcp/trace",       this::handleTrace);
+        // JSON-RPC 2.0 MCP endpoint (debug control tools)
+        if (rpcHandler != null) {
+            server.createContext("/mcp", rpcHandler::handle);
+        }
         server.setExecutor(null);
         server.start();
         LOG.info("MCP HTTP server started on port " + port);

@@ -1,7 +1,9 @@
 package com.tracer.edt.core;
 
 import com.tracer.edt.db.TraceRepository;
+import com.tracer.edt.debug.DebugService;
 import com.tracer.edt.mcp.McpHttpServer;
+import com.tracer.edt.mcp.McpJsonRpcHandler;
 import org.eclipse.core.runtime.Plugin;
 import org.eclipse.debug.core.DebugPlugin;
 import org.osgi.framework.BundleContext;
@@ -21,6 +23,7 @@ public class DebugTracerActivator extends Plugin {
     private AsyncTraceWriter writer;
     private TraceSessionManager sessionManager;
     private DebugTracerListener listener;
+    private DebugService debugService;
     private McpHttpServer httpServer;
 
     @Override
@@ -42,15 +45,25 @@ public class DebugTracerActivator extends Plugin {
         listener = new DebugTracerListener(writer, sessionManager);
         DebugPlugin.getDefault().addDebugEventListener(listener);
 
-        httpServer = new McpHttpServer(18080, sessionManager, writer, repo);
+        // Debug control service + event-driven wait_for_break
+        debugService = new DebugService();
+        DebugPlugin.getDefault().addDebugEventListener(debugService.getBreakListener());
+
+        // MCP JSON-RPC handler for debug tools
+        McpJsonRpcHandler rpcHandler = new McpJsonRpcHandler(debugService);
+
+        httpServer = new McpHttpServer(18080, sessionManager, writer, repo, rpcHandler);
         httpServer.start();
 
-        LOG.info("EDT Debug Tracer started. MCP: http://localhost:18080/mcp/health");
+        LOG.info("EDT Debug Tracer started. MCP: http://localhost:18080/mcp/health | JSON-RPC: POST /mcp");
     }
 
     @Override
     public void stop(BundleContext context) throws Exception {
         if (httpServer != null) httpServer.stop();
+        if (debugService != null) {
+            DebugPlugin.getDefault().removeDebugEventListener(debugService.getBreakListener());
+        }
         if (listener != null) DebugPlugin.getDefault().removeDebugEventListener(listener);
         if (writer != null) writer.stop();
         if (repo != null) repo.close();

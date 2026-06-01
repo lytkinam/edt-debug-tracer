@@ -11,4 +11,6 @@ Bundle-ClassPath: .,
  lib/sqlite-jdbc.jar
 Export-Package: com.tracer.edt.core,
  com.tracer.edt.db,
- com.tracer.edt.mcp
+ com.tracer.edt.debug,
+ com.tracer.edt.mcp,
+ com.tracer.edt.mcp.dto

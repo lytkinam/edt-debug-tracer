@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+dist/
+
+# sqlite-jdbc (downloaded by build.sh)
+plugin/lib/sqlite-jdbc.jar
+plugin.tests/lib/sqlite-jdbc.jar
+
+# IDE
+.settings/
+.classpath
+.project
+*.class
+
+# OS
+.DS_Store
+Thumbs.db
