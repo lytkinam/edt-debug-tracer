@@ -1,58 +1,55 @@
-"""Lightweight mock of the MCP HTTP server for CI testing.
-Mimics the real McpHttpServer.java behaviour without Eclipse.
-"""
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import json, threading
+#!/usr/bin/env python3
+"""Mock MCP server for Python CI tests."""
+from flask import Flask, request, jsonify
+import threading, time
 
-state = {"tracing": False, "entries": [], "session_id": None}
+app = Flask(__name__)
+state = {"active": False, "session_id": None, "steps": 0}
 
+@app.get("/mcp/health")
+def health():
+    return jsonify({"ok": True, "version": "1.0.0-mock"})
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass  # silence
+@app.get("/mcp/status")
+def status():
+    if state["active"]:
+        return jsonify({"active": True, "session_id": state["session_id"], "steps": state["steps"]})
+    return jsonify({"active": False})
 
-    def _respond(self, code, data):
-        body = json.dumps(data).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", len(body))
-        self.end_headers()
-        self.wfile.write(body)
+@app.post("/mcp/start")
+def start():
+    data = request.get_json(force=True, silent=True) or {}
+    sid = data.get("session_id", "")
+    if not sid:
+        return jsonify({"error": "session_id required"}), 400
+    if state["active"]:
+        return jsonify({"error": "session already active", "session_id": state["session_id"]}), 409
+    state.update({"active": True, "session_id": sid, "steps": 0})
+    return jsonify({"started": True, "session_id": sid})
 
-    def do_GET(self):
-        if self.path == "/mcp/health":
-            self._respond(200, {"status": "ok", "version": "1.0.0"})
-        elif self.path == "/mcp/status":
-            self._respond(200, {"tracing": state["tracing"],
-                                "entries_count": len(state["entries"]),
-                                "session_id": state["session_id"]})
-        else:
-            self._respond(404, {"error": "not_found"})
+@app.post("/mcp/stop")
+def stop():
+    sid = state["session_id"]
+    steps = state["steps"]
+    state.update({"active": False, "session_id": None, "steps": 0})
+    return jsonify({"stopped": True, "session_id": sid or "", "steps": steps})
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length) or b"{}")
-        if self.path == "/mcp/start":
-            if state["tracing"]:
-                self._respond(409, {"error": "already_running", "message": "Tracing session is already active"})
-            else:
-                state["tracing"] = True
-                state["entries"] = []
-                state["session_id"] = body.get("session_id")
-                self._respond(200, {"started": True, "session_id": state["session_id"]})
-        elif self.path == "/mcp/stop":
-            if not state["tracing"]:
-                self._respond(409, {"error": "not_running", "message": "No active tracing session"})
-            else:
-                state["tracing"] = False
-                resp = {"stopped": True, "session_id": state["session_id"], "entries": list(state["entries"])}
-                state["entries"] = []
-                state["session_id"] = None
-                self._respond(200, resp)
-        else:
-            self._respond(404, {"error": "not_found"})
+@app.post("/mcp/postprocess")
+def postprocess():
+    data = request.get_json(force=True, silent=True) or {}
+    sid = data.get("session_id", "")
+    if not sid:
+        return jsonify({"error": "session_id required"}), 400
+    return jsonify({"ok": True, "raw": 10, "clean": 3})
 
+@app.get("/mcp/trace")
+def trace():
+    sid = request.args.get("session", "")
+    t = request.args.get("type", "clean")
+    if not sid:
+        return jsonify({"error": "session param required"}), 400
+    return jsonify([{"kind": "step", "procedure": "MockProc", "line": 1, "module": "main",
+                     "repeat_count": 1, "pattern_len": 1, "ts": 0}])
 
 if __name__ == "__main__":
-    srv = HTTPServer(("localhost", 18080), Handler)
-    print("Mock MCP server listening on http://localhost:18080")
-    srv.serve_forever()
+    app.run(host="127.0.0.1", port=18080)
