@@ -1,97 +1,60 @@
-# 04. MCP HTTP Server API
+# 04. MCP Server API
 
-## Базовый URL
+Base URL: `http://localhost:18080`
 
-```
-http://localhost:18080/mcp
-```
-
-Порт можно переопределить системным свойством при запуске Eclipse:
-```
--Dedt.tracer.port=18080
-```
-
-## Эндпоинты
+## Endpoints
 
 ### GET /mcp/health
-
-Проверка, что сервер жив.
-
-**Ответ 200:**
+Returns server liveness.
 ```json
-{ "status": "ok", "version": "1.0.0" }
+{"ok": true, "version": "1.0.0"}
 ```
-
----
 
 ### GET /mcp/status
-
-Текущее состояние трассировки.
-
-**Ответ 200:**
+Returns current session state.
 ```json
-{
-  "tracing": false,
-  "entries_count": 0,
-  "session_id": null
-}
+{"active": true, "session_id": "van-001", "steps": 142}
 ```
-
----
+or
+```json
+{"active": false}
+```
 
 ### POST /mcp/start
-
-Начать запись трейса. Очищает предыдущий буфер.
-
-**Тело (опционально):**
+Request:
 ```json
-{ "session_id": "vanessa-step-42" }
+{"session_id": "van-001"}
 ```
-
-**Ответ 200:**
+Response 200:
 ```json
-{ "started": true, "session_id": "vanessa-step-42" }
+{"started": true, "session_id": "van-001"}
 ```
-
-**Ошибка (трассировка уже идёт), 409:**
+Response 409 (already active):
 ```json
-{ "error": "already_running", "message": "Tracing session is already active" }
+{"error": "session already active", "session_id": "van-001"}
 ```
-
----
 
 ### POST /mcp/stop
-
-Остановить запись и вернуть трейс.
-
-**Ответ 200:**
+Response 200:
 ```json
-{
-  "stopped": true,
-  "session_id": "vanessa-step-42",
-  "entries": [
-    {
-      "module": "ОбщийМодуль.УправлениеДолгами",
-      "line": 42,
-      "procedure": "РассчитатьДолг",
-      "timestamp": "2026-05-31T20:00:01.001Z",
-      "thread": "main"
-    }
-  ]
-}
+{"stopped": true, "session_id": "van-001", "steps": 142}
 ```
 
-**Ошибка (трассировка не запущена), 409:**
+### POST /mcp/postprocess
+Request:
 ```json
-{ "error": "not_running", "message": "No active tracing session" }
+{"session_id": "van-001"}
+```
+Response 200:
+```json
+{"ok": true, "raw": 142, "clean": 38}
 ```
 
----
+### GET /mcp/trace?session=van-001&type=raw
+Returns JSON array of trace entries.
+`type` = `raw` | `clean` (default: `clean`)
 
-## Коды ошибок
-
-| HTTP | error | Причина |
-|------|-------|---------|
-| 409 | already_running | start вызван дважды |
-| 409 | not_running | stop без start |
-| 500 | internal_error | необработанное исключение |
+## Error format
+```json
+{"error": "description", "code": 400}
+```

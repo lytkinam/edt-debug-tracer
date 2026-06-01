@@ -1,39 +1,22 @@
-# 01. Контекст и задача
+# 01. Context
 
-## Проблема
+## Problem
 
-При разработке и тестировании на платформе 1C:Предприятие 8.3 часто нужно знать:
-- какие процедуры/функции были вызваны в ходе сценарного теста Vanessa,
-- в какой последовательности и с какими строками кода,
-- где именно возникает ошибка в многоуровневом стеке вызовов.
+Standard 1C:EDT debugging is interactive. There is no built-in mechanism to:
+- automatically record every BSL execution step to a file or database;
+- expose that trace to an external tool (Vanessa, AI agent) via HTTP;
+- post-process the trace to collapse loops and repeated patterns.
 
-Стандартный журнал ТЖ (технологический журнал) даёт часть информации, но:
-- требует настройки logcfg.xml,
-- не привязан к конкретному шагу сценария Vanessa,
-- неудобен для автоматической обработки AI-агентом.
+## Why not TJ (Technological Journal)?
 
-## Решение
+ТЖ records DB-level events, not BSL source-level steps.
+It cannot tell you "line 42 of module ОбщийМодуль.Процедура1".
 
-Плагин `edt-debug-tracer` перехватывает события отладчика внутри EDT и пишет трейс на уровне каждого шага: модуль, строка, имя процедуры, timestamp. Vanessa управляет записью через HTTP API — начинает перед шагом, останавливает после, забирает JSON-лог.
+## Solution
 
-## Целевой сценарий
-
-```
-Vanessa                 EDT Plugin          1C Debug Target
-  |                        |                      |
-  |-- POST /mcp/start -->  |                      |
-  |                        |-- attach listener --> |
-  |-- [выполняет шаг] -->  |                      |
-  |                        |<- SUSPEND events ---- |
-  |                        |-- log TraceEntry      |
-  |-- POST /mcp/stop -->   |                      |
-  |<-- JSON trace log ---- |                      |
-```
-
-## AI-агент
-
-AI-агент (OpenAI / Gigachat / локальная модель) может:
-- вызвать `GET /mcp/status` — узнать, идёт ли трассировка,
-- вызвать `POST /mcp/start` / `POST /mcp/stop` — управлять сессией,
-- получить трейс и проанализировать стек вызовов,
-- сравнить с ожидаемым поведением и предложить правки кода.
+An Eclipse plugin that:
+1. Listens to Eclipse Debug events (SUSPEND on step);
+2. Reads the current BSL stack frame (module, line, procedure);
+3. Writes entries asynchronously to SQLite;
+4. Exposes the trace via a local HTTP MCP server;
+5. Allows post-processing (loop collapsing) on demand.

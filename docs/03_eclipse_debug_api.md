@@ -1,11 +1,6 @@
 # 03. Eclipse Debug API
 
-## Ключевые интерфейсы
-
-### DebugPlugin
-`org.eclipse.debug.core.DebugPlugin` — синглтон, точка входа:
-- `DebugPlugin.getDefault().addDebugEventListener(listener)` — подписаться на события.
-- `DebugPlugin.getDefault().removeDebugEventListener(listener)` — отписаться.
+## Key interfaces
 
 ### IDebugEventSetListener
 ```java
@@ -13,65 +8,47 @@ public interface IDebugEventSetListener {
     void handleDebugEvents(DebugEvent[] events);
 }
 ```
-Вызывается синхронно при каждом событии отладчика.
+Registered via `DebugPlugin.getDefault().addDebugEventListener(...)`.
+Called on the debug event dispatch thread — keep it fast, offload to queue.
 
-### DebugEvent
-Поля:
-- `getKind()` — `SUSPEND`, `RESUME`, `TERMINATE`, `CREATE`, `CHANGE`.
-- `getDetail()` — уточнение: `STEP_END`, `BREAKPOINT`, `CLIENT_REQUEST`.
-- `getSource()` — объект, породивший событие (чаще всего `IThread`).
+### DebugEvent kinds
+| Constant | When |
+|---|---|
+| `SUSPEND` | Thread stopped (breakpoint, step, exception) |
+| `RESUME`  | Thread continues |
+| `TERMINATE` | Debug session ended |
+| `CREATE`  | Debug target or thread created |
 
-### IThread / IStackFrame
+### Reading the stack frame
 ```java
-IThread thread = (IThread) event.getSource();
-IStackFrame frame = thread.getTopStackFrame();
-String name = frame.getName();      // имя процедуры/функции
-int    line = frame.getLineNumber(); // номер строки
-```
-
-## Паттерн обработчика
-
-```java
-@Override
-public void handleDebugEvents(DebugEvent[] events) {
-    for (DebugEvent event : events) {
-        if (event.getKind() == DebugEvent.SUSPEND
-            && event.getDetail() == DebugEvent.STEP_END) {
-            try {
-                IThread thread = (IThread) event.getSource();
-                IStackFrame frame = thread.getTopStackFrame();
-                if (frame != null) {
-                    buffer.add(new TraceEntry(
-                        frame.getName(),
-                        frame.getLineNumber(),
-                        thread.getName(),
-                        Instant.now()
-                    ));
-                }
-            } catch (DebugException e) {
-                // логировать, не пробрасывать
-            }
+if (event.getKind() == DebugEvent.SUSPEND) {
+    Object src = event.getSource();
+    if (src instanceof IThread thread) {
+        IStackFrame frame = thread.getTopStackFrame();
+        if (frame != null) {
+            String name   = frame.getName();         // "ПроцедураA line: 42"
+            int    line   = frame.getLineNumber();   // 42
+            String module = frame.getLaunch()        // approx module name
+                                 .getLaunchConfiguration().getName();
         }
     }
 }
 ```
 
-## Зависимости MANIFEST.MF
+### EDT-specific: BSL frame
+EDT wraps Eclipse IStackFrame in its own BSL implementation.
+The exact class is `com._1c.g5.v8.dt.debug.core.model.IBslStackFrame` (internal API).
+Safe approach: cast to `IStackFrame`, read `getName()` and `getLineNumber()`;
+parse procedure name from `getName()` with a regex `^(.*) line: (\\d+)$`.
 
+### Step control
+```java
+thread.stepInto();   // F5
+thread.stepOver();   // F6
+thread.resume();     // F8
 ```
-Require-Bundle: org.eclipse.debug.core,
- org.eclipse.core.runtime,
- com._1c.g5.v8.dt.debug.core;resolution:=optional
-```
 
-`com._1c.g5.v8.dt.debug.core` помечать `resolution:=optional` — чтобы плагин не падал, если EDT не установлен (например, при unit-тестах).
-
-## Полезные события
-
-| Kind | Detail | Когда |
-|------|--------|-------|
-| SUSPEND | STEP_END | после каждого шага F6/F7/F8 |
-| SUSPEND | BREAKPOINT | попали на точку останова |
-| SUSPEND | CLIENT_REQUEST | пауза по запросу (Pause button) |
-| RESUME | STEP_OVER | пользователь нажал F6 |
-| TERMINATE | — | сеанс отладки завершён |
+### Thread safety
+Debug events arrive on a dedicated thread.
+Never perform blocking I/O inside `handleDebugEvents`.
+Use `AsyncTraceWriter` queue pattern.

@@ -1,51 +1,42 @@
-# 02. Архитектура
+# 02. Architecture
 
-## Компоненты
+## Components
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  Eclipse / 1C:EDT                                   │
+│  Eclipse IDE (EDT installed as plugin)               │
 │                                                     │
-│  ┌──────────────────────┐                           │
-│  │  DebugTracerActivator │ OSGi bundle start/stop   │
-│  └──────────┬───────────┘                           │
-│             │                                       │
-│  ┌──────────▼───────────┐   ┌───────────────────┐  │
-│  │  DebugTracerListener  │──▶│  StepLogBuffer    │  │
-│  │  IDebugEventSetLstnr  │   │  List<TraceEntry> │  │
-│  └──────────────────────┘   └───────────────────┘  │
-│                                       │             │
-│  ┌────────────────────────────────────▼──────────┐  │
-│  │  McpHttpServer  (localhost:18080)              │  │
-│  │  GET /mcp/health  GET /mcp/status              │  │
-│  │  POST /mcp/start  POST /mcp/stop               │  │
-│  └───────────────────────────────────────────────┘  │
-└────────────────────────────┬────────────────────────┘
-                             │ HTTP
-          ┌──────────────────┴──────────────────┐
-          │                                     │
-   ┌──────▼──────┐                    ┌─────────▼──────┐
-   │   Vanessa   │                    │   AI-агент     │
-   │  (BDD тест) │                    │ (MCP client)   │
-   └─────────────┘                    └────────────────┘
+│  DebugTracerActivator  (OSGi Bundle start/stop)     │
+│    │                                                │
+│    ├── DebugTracerListener                          │
+│    │     listens: IDebugEventSetListener            │
+│    │     on SUSPEND → reads IStackFrame             │
+│    │     → enqueues TraceEntry                      │
+│    │                                                │
+│    ├── AsyncTraceWriter                             │
+│    │     background thread drains queue             │
+│    │     → TraceRepository.insertRawBatch()         │
+│    │                                                │
+│    ├── TraceRepository  (SQLite via JDBC)           │
+│    │     tables: sessions, raw_trace, clean_trace   │
+│    │                                                │
+│    └── McpHttpServer  (localhost:18080)             │
+│          POST /mcp/start                            │
+│          POST /mcp/stop                             │
+│          POST /mcp/postprocess                      │
+│          GET  /mcp/trace?session=&type=             │
+│          GET  /mcp/status                           │
+│          GET  /mcp/health                           │
+└─────────────────────────────────────────────────────┘
+         ▲              ▲
+    Vanessa      AI Agent (MCP client)
 ```
 
-## Поток данных
+## Data flow
 
-1. **OSGi старт** → `DebugTracerActivator.start()` регистрирует `DebugTracerListener` в `DebugPlugin` и запускает `McpHttpServer`.
-2. **Vanessa / агент** → `POST /mcp/start` → `StepLogBuffer.startSession()`.
-3. **Событие отладчика** → `DebugTracerListener.handleDebugEvents()` → при `SUSPEND` читает `IThread.getTopStackFrame()`, создаёт `TraceEntry`, кладёт в буфер.
-4. **Vanessa / агент** → `POST /mcp/stop` → `StepLogBuffer.stopSession()` → возвращает JSON-массив `TraceEntry`.
-5. **OSGi стоп** → `DebugTracerActivator.stop()` останавливает HTTP-сервер, убирает listener.
-
-## TraceEntry (JSON)
-
-```json
-{
-  "module": "ОбщийМодуль.УправлениеДолгами",
-  "line": 42,
-  "procedure": "РассчитатьДолг",
-  "timestamp": "2026-05-31T20:00:00.123Z",
-  "thread": "main"
-}
-```
+1. Vanessa calls `POST /mcp/start {session_id}`
+2. 1C application runs under EDT debugger
+3. Each step → SUSPEND event → TraceEntry → SQLite raw_trace
+4. Vanessa calls `POST /mcp/stop`
+5. Agent calls `POST /mcp/postprocess` → LoopCollapser → clean_trace
+6. Agent calls `GET /mcp/trace?session=...&type=clean` → JSON

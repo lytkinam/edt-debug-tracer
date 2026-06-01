@@ -1,4 +1,4 @@
-name: Build & Test
+name: Build EDT Debug Tracer
 
 on:
   push:
@@ -7,24 +7,19 @@ on:
     branches: [ main ]
 
 jobs:
-  api-tests:
-    name: MCP API smoke tests (mock server)
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install test dependencies
-        run: pip install -r tests/requirements.txt
-
-      - name: Start mock MCP server
+      - name: Install Python deps
+        run: pip install requests flask
+      - name: Run Python API tests (mock)
         run: |
-          python tests/mock_server.py &
+          cd tests
+          python mock_server.py &
           sleep 1
-
-      - name: Run API tests
-        run: python tests/test_mcp_api.py
+          python test_mcp_api.py
