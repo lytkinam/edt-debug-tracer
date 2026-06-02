@@ -14,6 +14,7 @@ import java.util.Properties;
 public class TestActivator implements BundleActivator {
     private HttpServer server;
     private TracerListener tracer;
+    private TracerStorage storage;
     private int port = 18080;
     private String outputPath;
 
@@ -42,6 +43,28 @@ public class TestActivator implements BundleActivator {
         tracer = new TracerListener();
         tracer.setOutputPath(outputPath);
         tracer.setConfig(props);
+
+        // Initialize SQLite storage (P2)
+        String storageMode = props.getProperty("storage.mode", "both");
+        if ("sqlite".equals(storageMode) || "both".equals(storageMode)) {
+            String dbPath = props.getProperty("storage.sqlite.path");
+            if (dbPath == null) dbPath = new File(cfgDir, "tracer.db").getAbsolutePath();
+            dbPath = dbPath.replace("{workspace}", workspacePath);
+            try {
+                storage = new TracerStorage(dbPath);
+                storage.setBatchSize(Integer.parseInt(props.getProperty("storage.sqlite.batch.size", "50")));
+                storage.setBatchTimeoutMs(Long.parseLong(props.getProperty("storage.sqlite.batch.timeout.ms", "200")));
+                storage.setWalMode(Boolean.parseBoolean(props.getProperty("storage.sqlite.wal", "true")));
+                storage.setCacheSize(Integer.parseInt(props.getProperty("storage.sqlite.cacheSize", "8000")));
+                storage.open();
+                tracer.setStorage(storage);
+                System.out.println("[tracer] SQLite storage: " + dbPath);
+            } catch (Exception e) {
+                System.err.println("[tracer] SQLite init error: " + e.getMessage());
+                storage = null;
+            }
+        }
+
         DebugPlugin.getDefault().addDebugEventListener(tracer);
 
         server = HttpServer.create(new java.net.InetSocketAddress("localhost", port), 0);
@@ -87,6 +110,7 @@ public class TestActivator implements BundleActivator {
     public void stop(BundleContext ctx) throws Exception {
         if (server != null) server.stop(0);
         if (tracer != null) DebugPlugin.getDefault().removeDebugEventListener(tracer);
+        if (storage != null) storage.close();
     }
 
     private static void respond(com.sun.net.httpserver.HttpExchange ex, int code, String body)

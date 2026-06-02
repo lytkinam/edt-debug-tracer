@@ -33,6 +33,11 @@ public class TracerListener implements IDebugEventSetListener {
     private Thread writerThread;
     private volatile String outputPath;
 
+    // Storage (P2)
+    private TracerStorage storage;
+    private volatile String storageMode = "both"; // file, sqlite, both
+    private volatile String currentSessionId;
+
     // Config: module capture (1.1)
     private volatile boolean captureModuleEnabled = true;
     private volatile String captureModuleFallback = "";
@@ -62,8 +67,11 @@ public class TracerListener implements IDebugEventSetListener {
     private int currentSeq = 0;
 
     public void setOutputPath(String path) { this.outputPath = path; }
+    public void setStorage(TracerStorage storage) { this.storage = storage; }
 
     public void setConfig(Properties props) {
+        storageMode = props.getProperty("storage.mode", "both");
+
         captureModuleEnabled = Boolean.parseBoolean(
             props.getProperty("capture.module.enabled", "true"));
         captureModuleFallback = props.getProperty("capture.module.fallback", "");
@@ -101,6 +109,19 @@ public class TracerListener implements IDebugEventSetListener {
         currentParentSeq = -1;
         currentSeq = 0;
         for (int i = 0; i < 256; i++) lastStepAtDepth[i] = -1;
+
+        // Create SQLite session (P2)
+        if (storage != null && (storageMode.equals("sqlite") || storageMode.equals("both"))) {
+            try {
+                currentSessionId = storage.createSession(null, null, null, null, null);
+                storage.startWriter();
+                System.out.println("[tracer] SQLite session: " + currentSessionId);
+            } catch (Exception e) {
+                System.err.println("[tracer] SQLite session error: " + e.getMessage());
+                currentSessionId = null;
+            }
+        }
+
         recording.set(true);
         startWriter();
     }
@@ -110,6 +131,18 @@ public class TracerListener implements IDebugEventSetListener {
         autoStepping.set(false);
         stepsRemaining.set(0);
         stopWriter();
+
+        // Flush SQLite (P2)
+        if (storage != null && currentSessionId != null) {
+            try {
+                storage.stopWriter();
+                storage.updateSession(currentSessionId, "stopped", totalSteps, totalSteps - entries.size());
+                System.out.println("[tracer] SQLite session stopped: " + totalSteps + " steps");
+            } catch (Exception e) {
+                System.err.println("[tracer] SQLite stop error: " + e.getMessage());
+            }
+        }
+
         return List.copyOf(entries);
     }
 
@@ -363,6 +396,16 @@ public class TracerListener implements IDebugEventSetListener {
                     charStart, charEnd, stackDepth, parentSeq, stackJson,
                     variablesJson);
                 totalSteps++;
+
+                // Queue to SQLite storage (P2)
+                if (storage != null && currentSessionId != null) {
+                    storage.queueStep(currentSessionId, currentSeq,
+                        entry.timestamp(), entry.procedure(), entry.line(), entry.module(),
+                        entry.charStart(), entry.charEnd(),
+                        entry.threadId(), entry.threadName(),
+                        entry.stackDepth(), entry.parentSeq(),
+                        entry.stackJson(), entry.variablesJson());
+                }
 
                 // Offload to writer queue — non-blocking
                 queue.offer(entry);
