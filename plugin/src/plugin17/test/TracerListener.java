@@ -86,6 +86,25 @@ public class TracerListener implements IDebugEventSetListener {
     private volatile String autoStepStopOnProcedure = "";
     private volatile int autoStepStopOnLine = 0;
 
+    // Config: performance (P6)
+    private volatile int writerBufferSize = 100_000;
+    private volatile int writerFlushEntries = 100;
+    private volatile long writerFlushMs = 500;
+    private volatile boolean profilingEnabled = false;
+    private volatile int profilingSampleRate = 100;
+
+    // Config: reliability (P7)
+    private volatile boolean reliabilityStopOnTerminate = true;
+    private volatile boolean reliabilityFlushOnTerminate = true;
+    private volatile int reliabilityMaxErrors = 10;
+    private volatile boolean reliabilityRetryStepOver = false;
+    private volatile long reliabilityRetryDelayMs = 100;
+    private volatile boolean reliabilityGracefulShutdown = true;
+
+    // Config: logging (P8.3)
+    private volatile String loggingLevel = "INFO";
+    private volatile String loggingPrefix = "[tracer]";
+
     // State: parentSeq tracking (1.5)
     private int previousDepth = -1;
     private int currentParentSeq = -1;
@@ -156,6 +175,36 @@ public class TracerListener implements IDebugEventSetListener {
         autoStepStopOnProcedure = props.getProperty("autoStep.stopOnProcedure", "");
         autoStepStopOnLine = Integer.parseInt(
             props.getProperty("autoStep.stopOnLine", "0"));
+
+        // P6: performance
+        writerBufferSize = Integer.parseInt(
+            props.getProperty("writer.buffer.size", "100000"));
+        writerFlushEntries = Integer.parseInt(
+            props.getProperty("writer.flush.interval.entries", "100"));
+        writerFlushMs = Long.parseLong(
+            props.getProperty("writer.flush.interval.ms", "500"));
+        profilingEnabled = Boolean.parseBoolean(
+            props.getProperty("profiling.enabled", "false"));
+        profilingSampleRate = Integer.parseInt(
+            props.getProperty("profiling.sampleRate", "100"));
+
+        // P7: reliability
+        reliabilityStopOnTerminate = Boolean.parseBoolean(
+            props.getProperty("reliability.stopOnTerminate", "true"));
+        reliabilityFlushOnTerminate = Boolean.parseBoolean(
+            props.getProperty("reliability.flushOnTerminate", "true"));
+        reliabilityMaxErrors = Integer.parseInt(
+            props.getProperty("reliability.maxErrors", "10"));
+        reliabilityRetryStepOver = Boolean.parseBoolean(
+            props.getProperty("reliability.retryStepOver", "false"));
+        reliabilityRetryDelayMs = Long.parseLong(
+            props.getProperty("reliability.retryDelay.ms", "100"));
+        reliabilityGracefulShutdown = Boolean.parseBoolean(
+            props.getProperty("reliability.gracefulShutdown", "true"));
+
+        // P8.3: logging
+        loggingLevel = props.getProperty("logging.level", "INFO");
+        loggingPrefix = props.getProperty("logging.prefix", "[tracer]");
     }
 
     // State: dedup tracking (P3.1)
@@ -248,17 +297,30 @@ public class TracerListener implements IDebugEventSetListener {
                     default: thread.stepOver(); break;
                 }
             } catch (DebugException e) {
-                if (autoStepStopOnException) {
+                // P7.2: retry stepOver on error
+                if (reliabilityRetryStepOver) {
+                    try { Thread.sleep(reliabilityRetryDelayMs); thread.stepOver(); }
+                    catch (Exception retry) {
+                        if (autoStepStopOnException) {
+                            autoStepping.set(false);
+                            logMsg("auto-step stopped on exception after retry");
+                        }
+                    }
+                } else if (autoStepStopOnException) {
                     autoStepping.set(false);
-                    System.out.println("[tracer] auto-step stopped on exception");
+                    logMsg("auto-step stopped on exception");
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         } else if (autoStepping.get()) {
             autoStepping.set(false);
-            System.out.println("[tracer] auto-step complete, total=" + totalSteps);
+            logMsg("auto-step complete, total=" + totalSteps);
         }
+    }
+
+    private void logMsg(String msg) {
+        System.out.println(loggingPrefix + " " + msg);
     }
 
     private IThread findSuspendedThread() {

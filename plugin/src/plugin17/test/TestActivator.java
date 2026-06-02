@@ -18,6 +18,15 @@ public class TestActivator implements BundleActivator {
     private int port = 18080;
     private String outputPath;
 
+    // P9: server config
+    private String serverHost = "localhost";
+    private int serverBacklog = 50;
+    private int serverThreads = 4;
+    private boolean serverCorsEnabled = false;
+    private boolean serverAuthEnabled = false;
+    private String serverAuthToken = "";
+    private String serverAuthScheme = "Bearer";
+
     @Override
     public void start(BundleContext ctx) throws Exception {
         // Read config from workspace, not from user.home
@@ -67,20 +76,33 @@ public class TestActivator implements BundleActivator {
 
         DebugPlugin.getDefault().addDebugEventListener(tracer);
 
-        server = HttpServer.create(new java.net.InetSocketAddress("localhost", port), 0);
-        server.createContext("/mcp/health", ex ->
+        // P9: read server config
+        serverHost = props.getProperty("server.host", "localhost");
+        serverBacklog = Integer.parseInt(props.getProperty("server.backlog", "50"));
+        serverThreads = Integer.parseInt(props.getProperty("server.threads", "4"));
+        serverCorsEnabled = Boolean.parseBoolean(props.getProperty("server.cors.enabled", "false"));
+        serverAuthEnabled = Boolean.parseBoolean(props.getProperty("server.auth.enabled", "false"));
+        serverAuthToken = props.getProperty("server.auth.token", "");
+        serverAuthScheme = props.getProperty("server.auth.scheme", "Bearer");
+
+        server = HttpServer.create(new java.net.InetSocketAddress(serverHost, port), serverBacklog);
+        server.createContext("/mcp/health", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
             respond(ex, 200, "{\"ok\":true,\"recording\":" + tracer.isRecording()
                 + ",\"autoStepping\":" + tracer.isAutoStepping()
-                + ",\"entries\":" + tracer.size() + ",\"port\":" + port + "}"));
+                + ",\"entries\":" + tracer.size() + ",\"port\":" + port + "}");
+        });
 
         server.createContext("/mcp/start", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
             tracer.startRecording();
             respond(ex, 200, "{\"started\":true}");
         });
 
         server.createContext("/mcp/run", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
             String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-            int steps = 1000;
+            int steps = 0;
             int idx = body.indexOf("\"steps\"");
             if (idx >= 0) {
                 int colon = body.indexOf(':', idx);
@@ -95,6 +117,7 @@ public class TestActivator implements BundleActivator {
         });
 
         server.createContext("/mcp/stop", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
             List<StepEntry> entries = tracer.stopRecording();
             respond(ex, 200, "{\"stopped\":true,\"count\":" + entries.size()
                 + ",\"totalSteps\":" + tracer.getTotalSteps()
@@ -103,6 +126,7 @@ public class TestActivator implements BundleActivator {
 
         // P3.4: Status endpoint
         server.createContext("/mcp/status", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
             StringBuilder sb = new StringBuilder("{");
             sb.append("\"ok\":true");
             sb.append(",\"recording\":").append(tracer.isRecording());
@@ -121,9 +145,21 @@ public class TestActivator implements BundleActivator {
             respond(ex, 200, sb.toString());
         });
 
-        server.setExecutor(null);
+        server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(serverThreads));
         server.start();
-        System.out.println("[tracer] Active on :" + port + ", workspace: " + workspacePath);
+        System.out.println("[tracer] Active on " + serverHost + ":" + port
+            + ", threads=" + serverThreads
+            + (serverAuthEnabled ? ", auth=on" : "")
+            + ", workspace: " + workspacePath);
+    }
+
+    // P9: Auth check
+    private boolean checkAuth(com.sun.net.httpserver.HttpExchange ex) {
+        if (!serverAuthEnabled) return true;
+        String auth = ex.getRequestHeaders().getFirst("Authorization");
+        if (auth == null) return false;
+        String expected = serverAuthScheme + " " + serverAuthToken;
+        return auth.equals(expected);
     }
 
     @Override
