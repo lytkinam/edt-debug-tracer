@@ -121,108 +121,186 @@ capture.callStack.includeVariables=false
 
 ## Приоритет 2: Хранение данных
 
-### 2.1 MySQL: запись сырых данных
+### 2.1 SQLite — основная база данных
 
-Запись каждого StepEntry в MySQL в реальном времени. Отдельный процесс/скрипт разбирает сырые данные после остановки записи.
+SQLite — подножная база для плагина. Файловая БД, не требует сервера, портативна, встроена в JVM через sqlite-jdbc. Каждая сессия записи — одна транзакция в SQLite. Пост-обработка читает ту же БД.
 
-**Схема таблиц:**
+**Путь к БД:** `{workspace}/.edt-debug-tracer/tracer.db`
+
+#### Схема БД (финальная)
 
 ```sql
-CREATE TABLE tracer_sessions (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    session_id VARCHAR(64) UNIQUE NOT NULL,
-    workspace VARCHAR(512),
-    started_at DATETIME(3) NOT NULL,
-    stopped_at DATETIME(3),
-    status ENUM('active','stopped','error') DEFAULT 'active',
-    total_steps INT DEFAULT 0,
-    config_json TEXT
+-- Сессия записи (одна запись на /mcp/start → /mcp/stop)
+CREATE TABLE IF NOT EXISTS sessions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT UNIQUE NOT NULL,           -- UUID или пользовательский ID
+    -- Идентификация проекта/приложения
+    project_name    TEXT,                           -- имя EDT-проекта (из launch config)
+    workspace_path  TEXT,                           -- путь к workspace (Platform.getInstanceLocation)
+    launch_config   TEXT,                           -- имя launch configuration
+    debug_target    TEXT,                           -- тип цели: "1C:Enterprise", "Java Application"
+    -- Временные метки
+    started_at      INTEGER NOT NULL,               -- System.currentTimeMillis()
+    stopped_at      INTEGER,
+    -- Статус и счётчики
+    status          TEXT DEFAULT 'active',          -- active | stopped | error
+    total_steps     INTEGER DEFAULT 0,
+    auto_steps      INTEGER DEFAULT 0,              -- сколько шагов выполнено auto-step
+    -- Конфиг сессии (snapshot на момент start)
+    config_json     TEXT
 );
 
-CREATE TABLE tracer_steps (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    session_id VARCHAR(64) NOT NULL,
-    seq INT NOT NULL,
-    ts BIGINT NOT NULL,
-    thread_id INT,
-    thread_name VARCHAR(256),
-    procedure_name VARCHAR(1024),
-    line_number INT,
-    module VARCHAR(512),
-    char_start INT,
-    char_end INT,
-    variables_json TEXT,
-    call_stack_json TEXT,
-    INDEX idx_session_seq (session_id, seq),
-    INDEX idx_session_ts (session_id, ts),
-    INDEX idx_procedure (procedure_name(100))
+CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_name);
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
+
+-- Сырые шаги (один ряд = один SUSPEND event)
+CREATE TABLE IF NOT EXISTS steps (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL REFERENCES sessions(session_id),
+    seq             INTEGER NOT NULL,               -- порядковый номер шага в сессии (1, 2, 3...)
+    ts              INTEGER NOT NULL,               -- System.currentTimeMillis()
+    -- Позиция
+    procedure_name  TEXT NOT NULL,                  -- IStackFrame.getName() — полное имя с параметрами
+    line_number     INTEGER NOT NULL,               -- IStackFrame.getLineNumber()
+    module_path     TEXT,                           -- ISourceLocator.getSourceElement() — путь к модулю
+    char_start      INTEGER DEFAULT -1,             -- IStackFrame.getCharStart()
+    char_end        INTEGER DEFAULT -1,             -- IStackFrame.getCharEnd()
+    -- Поток
+    thread_id       INTEGER,                        -- System.identityHashCode(thread)
+    thread_name     TEXT,                           -- thread.getName() — "Сервер [admin]"
+    -- Иерархия вызовов (для графа зависимостей)
+    stack_depth     INTEGER DEFAULT 0,              -- frames.length — глубина стека
+    parent_seq      INTEGER,                        -- seq шага-родителя (кто вызвал)
+    stack_json      TEXT,                           -- полный стек: [{procedure, line}, ...]
+    -- Переменные (опционально)
+    variables_json  TEXT,                           -- {name: {type, value, hasChildren}}
+    -- Индексы
+    UNIQUE(session_id, seq)
 );
 
-CREATE TABLE tracer_analysis (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    session_id VARCHAR(64) NOT NULL,
-    analysis_type VARCHAR(64) NOT NULL,
-    result_json LONGTEXT,
-    created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_session_type (session_id, analysis_type)
+CREATE INDEX IF NOT EXISTS idx_steps_session ON steps(session_id);
+CREATE INDEX IF NOT EXISTS idx_steps_seq ON steps(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_steps_procedure ON steps(session_id, procedure_name);
+CREATE INDEX IF NOT EXISTS idx_steps_parent ON steps(session_id, parent_seq);
+CREATE INDEX IF NOT EXISTS idx_steps_depth ON steps(session_id, stack_depth);
+CREATE INDEX IF NOT EXISTS idx_steps_module ON steps(session_id, module_path);
+CREATE INDEX IF NOT EXISTS idx_steps_thread ON steps(session_id, thread_id);
+
+-- Результаты пост-обработки
+CREATE TABLE IF NOT EXISTS analysis (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL REFERENCES sessions(session_id),
+    analysis_type   TEXT NOT NULL,                  -- loopCollapse | callTree | dependencyGraph | hotSpots | timing
+    result_json     TEXT,
+    created_at      INTEGER DEFAULT (strftime('%s','now') * 1000)
 );
+
+CREATE INDEX IF NOT EXISTS idx_analysis_session ON analysis(session_id, analysis_type);
+
+-- Граф зависимостей (материализованное представление из steps)
+CREATE TABLE IF NOT EXISTS call_edges (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL REFERENCES sessions(session_id),
+    caller_module   TEXT,                           -- модуль вызывающего
+    caller_proc     TEXT,                           -- процедура вызывающего
+    callee_module   TEXT,                           -- модуль вызываемого
+    callee_proc     TEXT,                           -- процедура вызываемого
+    call_count      INTEGER DEFAULT 1,
+    avg_depth       REAL,
+    first_seq       INTEGER,                        -- первый seq этого вызова
+    last_seq        INTEGER                         -- последний seq этого вызова
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_session ON call_edges(session_id);
+CREATE INDEX IF NOT EXISTS idx_edges_caller ON call_edges(session_id, caller_proc);
+CREATE INDEX IF NOT EXISTS idx_edges_callee ON call_edges(session_id, callee_proc);
 ```
 
-**Конфигурация:**
-```properties
-storage.type=file
-storage.mysql.host=localhost
-storage.mysql.port=3306
-storage.mysql.database=tracer
-storage.mysql.username=tracer
-storage.mysql.password=
-storage.mysql.table.sessions=tracer_sessions
-storage.mysql.table.steps=tracer_steps
-storage.mysql.table.analysis=tracer_analysis
-storage.mysql.batch.size=100
-storage.mysql.batch.timeout.ms=500
-storage.mysql.pool.maxSize=5
-storage.mysql.ssl=false
+#### Идентификация проекта
+
+При `/mcp/start` плагин определяет контекст отладки:
+
+```java
+// Из launch configuration
+ILaunch[] launches = DebugPlugin.getDefault().getLaunchManager().getLaunches();
+for (ILaunch launch : launches) {
+    ILaunchConfiguration config = launch.getLaunchConfiguration();
+    String projectName = config.getAttribute("com._1c.g5.v8.dt.debug.core.ATTR_PROJECT_NAME", "");
+    String configName = config.getName();
+    // ...
+}
+
+// Из workspace
+String workspacePath = Platform.getInstanceLocation().getURL().getPath();
 ```
 
-| Параметр | Тип | По умолчанию | Описание |
-|----------|-----|-------------|----------|
-| `storage.type` | string | `file` | Тип хранилища: `file`, `mysql`, `sqlite`, `both` |
-| `storage.mysql.host` | string | `localhost` | Хост MySQL |
-| `storage.mysql.port` | int | `3306` | Порт MySQL |
-| `storage.mysql.database` | string | `tracer` | Имя базы данных |
-| `storage.mysql.username` | string | `tracer` | Пользователь |
-| `storage.mysql.password` | string | `""` | Пароль |
-| `storage.mysql.table.sessions` | string | `tracer_sessions` | Таблица сессий |
-| `storage.mysql.table.steps` | string | `tracer_steps` | Таблица шагов |
-| `storage.mysql.table.analysis` | string | `tracer_analysis` | Таблица результатов анализа |
-| `storage.mysql.batch.size` | int | `100` | Размер batch для INSERT |
-| `storage.mysql.batch.timeout.ms` | int | `500` | Flush batch по таймауту (ms) |
-| `storage.mysql.pool.maxSize` | int | `5` | Максимум соединений в пуле |
-| `storage.mysql.ssl` | boolean | `false` | SSL-подключение |
+Поля `project_name`, `workspace_path`, `launch_config`, `debug_target` заполняются автоматически при старте записи. Это решает проблему "не нашел проекта в рамках которого проходила запись".
 
-### 2.2 SQLite: локальная альтернатива
+#### Пример записи в sessions
 
-Для случаев когда MySQL недоступен (offline, dev-окружение):
-
-```properties
-storage.type=sqlite
-storage.sqlite.path={workspace}/.edt-debug-tracer/trace.db
-storage.sqlite.wal=true
-storage.sqlite.batch.size=50
+```json
+{
+    "session_id": "s-20260602-143052-a1b2c3",
+    "project_name": "smallbase_test_db",
+    "workspace_path": "/home/ai/workspace-edt2025",
+    "launch_config": "smallbase_test_db (Отладка)",
+    "debug_target": "1C:Enterprise",
+    "started_at": 1780382800000,
+    "stopped_at": 1780382805000,
+    "status": "stopped",
+    "total_steps": 30,
+    "auto_steps": 29
+}
 ```
 
-| Параметр | Тип | По умолчанию | Описание |
-|----------|-----|-------------|----------|
-| `storage.type` | string | `file` | `sqlite` для локальной БД |
-| `storage.sqlite.path` | string | `{workspace}/.edt-debug-tracer/trace.db` | Путь к файлу БД |
-| `storage.sqlite.wal` | boolean | `true` | WAL mode для concurrent reads |
-| `storage.sqlite.batch.size` | int | `50` | Размер batch |
+#### Пример записи в steps
 
-### 2.3 Файл: текущий режим
+```json
+{
+    "seq": 5,
+    "ts": 1780382800594,
+    "procedure_name": "ОбщийМодуль.СтандартныеПодсистемыСервер.Модуль.УстановкаПараметровСеанса(ИменаПараметровСеанса = ) строка: 47",
+    "line_number": 47,
+    "module_path": "CommonModules/СтандартныеПодсистемыСервер/Module.bsl",
+    "char_start": 1234,
+    "char_end": 1289,
+    "thread_id": 646430608,
+    "thread_name": "Сервер [admin]",
+    "stack_depth": 3,
+    "parent_seq": 2,
+    "stack_json": "[{\"procedure\":\"...:47\",\"line\":47},{\"procedure\":\"МодульСеанса:19\",\"line\":19},{\"procedure\":\"<EntryPoint>\",\"line\":0}]",
+    "variables_json": null
+}
+```
+
+#### Построение графа зависимостей из steps
+
+```sql
+-- Материализация call_edges из steps (выполняется при пост-обработке)
+INSERT INTO call_edges (session_id, caller_module, caller_proc, callee_module, callee_proc, call_count, first_seq, last_seq)
+SELECT
+    s.session_id,
+    p.module_path AS caller_module,
+    p.procedure_name AS caller_proc,
+    s.module_path AS callee_module,
+    s.procedure_name AS callee_proc,
+    COUNT(*) AS call_count,
+    MIN(s.seq) AS first_seq,
+    MAX(s.seq) AS last_seq
+FROM steps s
+JOIN steps p ON p.session_id = s.session_id AND p.seq = s.parent_seq
+WHERE s.parent_seq IS NOT NULL
+GROUP BY s.session_id, caller_module, caller_proc, callee_module, callee_proc;
+```
+
+### 2.2 Файл: совместимость
+
+Текущий режим (JSON-файл) сохраняется для обратной совместимости и быстрого просмотра:
 
 ```properties
-storage.type=file
+storage.mode=sqlite
+storage.file.enabled=true
 storage.file.path={workspace}/.edt-debug-tracer/trace.json
 storage.file.format=json
 storage.file.pretty=false
@@ -230,20 +308,59 @@ storage.file.pretty=false
 
 | Параметр | Тип | По умолчанию | Описание |
 |----------|-----|-------------|----------|
+| `storage.mode` | string | `sqlite` | Основной режим: `sqlite`, `file`, `both` |
+| `storage.file.enabled` | boolean | `true` | Дополнительно писать JSON-файл |
 | `storage.file.path` | string | `{workspace}/.edt-debug-tracer/trace.json` | Путь к файлу |
-| `storage.file.format` | string | `json` | Формат: `json` (массив) или `ndjson` (по строке) |
-| `storage.file.pretty` | boolean | `false` | Форматированный JSON (для чтения человеком) |
+| `storage.file.format` | string | `json` | `json` (массив) или `ndjson` (по строке) |
+| `storage.file.pretty` | boolean | `false` | Форматированный JSON |
 
-### 2.4 Dual storage (file + mysql)
+В режиме `both` — запись идёт и в SQLite (основная), и в JSON-файл (для быстрого просмотра/отладки).
 
-Запись одновременно в файл и в MySQL — для надёжности:
+### 2.3 SQLite: конфигурация
 
 ```properties
-storage.type=both
-storage.file.path={workspace}/.edt-debug-tracer/trace.json
-storage.mysql.host=localhost
-storage.mysql.database=tracer
+storage.sqlite.path={workspace}/.edt-debug-tracer/tracer.db
+storage.sqlite.wal=true
+storage.sqlite.batch.size=50
+storage.sqlite.batch.timeout.ms=200
+storage.sqlite.journalMode=WAL
+storage.sqlite.synchronous=NORMAL
+storage.sqlite.cacheSize=8000
 ```
+
+| Параметр | Тип | По умолчанию | Описание |
+|----------|-----|-------------|----------|
+| `storage.sqlite.path` | string | `{workspace}/.edt-debug-tracer/tracer.db` | Путь к файлу БД |
+| `storage.sqlite.wal` | boolean | `true` | WAL mode (concurrent reads) |
+| `storage.sqlite.batch.size` | int | `50` | Размер batch для INSERT |
+| `storage.sqlite.batch.timeout.ms` | int | `200` | Flush batch по таймауту (ms) |
+| `storage.sqlite.journalMode` | string | `WAL` | PRAGMA journal_mode |
+| `storage.sqlite.synchronous` | string | `NORMAL` | PRAGMA synchronous (NORMAL для WAL) |
+| `storage.sqlite.cacheSize` | int | `8000` | PRAGMA cache_size (страниц, 8000 × 4KB = 32MB) |
+
+### 2.4 MySQL: опциональный экспорт
+
+MySQL не используется для записи в реальном времени. Вместо этого — экспорт из SQLite в MySQL после остановки записи (для централизованного хранения/аналитики):
+
+```properties
+storage.mysql.export=false
+storage.mysql.host=localhost
+storage.mysql.port=3306
+storage.mysql.database=tracer
+storage.mysql.username=tracer
+storage.mysql.password=
+storage.mysql.exportOnStop=false
+```
+
+| Параметр | Тип | По умолчанию | Описание |
+|----------|-----|-------------|----------|
+| `storage.mysql.export` | boolean | `false` | Включить экспорт в MySQL |
+| `storage.mysql.host` | string | `localhost` | Хост MySQL |
+| `storage.mysql.port` | int | `3306` | Порт MySQL |
+| `storage.mysql.database` | string | `tracer` | Имя базы данных |
+| `storage.mysql.username` | string | `tracer` | Пользователь |
+| `storage.mysql.password` | string | `""` | Пароль |
+| `storage.mysql.exportOnStop` | boolean | `false` | Автоматический экспорт при `/mcp/stop` |
 
 ### 2.5 Пост-обработка сырых данных
 
