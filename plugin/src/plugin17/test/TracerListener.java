@@ -9,6 +9,8 @@ import org.eclipse.debug.core.model.IStackFrame;
 import org.eclipse.debug.core.model.IThread;
 import org.eclipse.debug.core.model.IDebugTarget;
 import org.eclipse.debug.core.model.ISourceLocator;
+import org.eclipse.debug.core.model.IVariable;
+import org.eclipse.debug.core.model.IValue;
 import java.io.FileWriter;
 import java.io.File;
 import java.util.List;
@@ -35,12 +37,29 @@ public class TracerListener implements IDebugEventSetListener {
     private volatile boolean captureModuleEnabled = true;
     private volatile String captureModuleFallback = "";
 
+    // Config: variables capture (1.2)
+    private volatile boolean captureVariablesEnabled = true;
+    private volatile int captureVariablesMaxCount = 50;
+    private volatile boolean captureVariablesIncludeTypes = true;
+    private volatile int captureVariablesMaxValueLength = 200;
+    private volatile String captureVariablesExcludeNames = "";
+
     public void setOutputPath(String path) { this.outputPath = path; }
 
     public void setConfig(Properties props) {
         captureModuleEnabled = Boolean.parseBoolean(
             props.getProperty("capture.module.enabled", "true"));
         captureModuleFallback = props.getProperty("capture.module.fallback", "");
+
+        captureVariablesEnabled = Boolean.parseBoolean(
+            props.getProperty("capture.variables.enabled", "true"));
+        captureVariablesMaxCount = Integer.parseInt(
+            props.getProperty("capture.variables.maxCount", "50"));
+        captureVariablesIncludeTypes = Boolean.parseBoolean(
+            props.getProperty("capture.variables.includeTypes", "true"));
+        captureVariablesMaxValueLength = Integer.parseInt(
+            props.getProperty("capture.variables.maxValueLength", "200"));
+        captureVariablesExcludeNames = props.getProperty("capture.variables.excludeNames", "");
     }
 
     public void startRecording() {
@@ -156,6 +175,62 @@ public class TracerListener implements IDebugEventSetListener {
     public int size() { return entries.size(); }
     public int getTotalSteps() { return totalSteps; }
 
+    // --- Variables capture helper (1.2) ---
+    private String captureVariables(IStackFrame frame) {
+        if (!captureVariablesEnabled) return null;
+        try {
+            IVariable[] vars = frame.getVariables();
+            if (vars == null || vars.length == 0) return null;
+
+            StringBuilder sb = new StringBuilder("{");
+            int count = 0;
+            String[] excludePatterns = captureVariablesExcludeNames.isEmpty()
+                ? new String[0] : captureVariablesExcludeNames.split(",");
+
+            for (IVariable var : vars) {
+                if (count >= captureVariablesMaxCount) break;
+                try {
+                    String name = var.getName();
+                    // Check exclude patterns
+                    boolean excluded = false;
+                    for (String pattern : excludePatterns) {
+                        String p = pattern.trim();
+                        if (p.endsWith("*") && name.startsWith(p.substring(0, p.length() - 1))) {
+                            excluded = true; break;
+                        } else if (name.equals(p)) {
+                            excluded = true; break;
+                        }
+                    }
+                    if (excluded) continue;
+
+                    if (count > 0) sb.append(",");
+                    sb.append("\"").append(esc(name)).append("\":{");
+
+                    if (captureVariablesIncludeTypes) {
+                        String type = var.getReferenceTypeName();
+                        sb.append("\"type\":\"").append(esc(type)).append("\",");
+                    }
+
+                    IValue value = var.getValue();
+                    String valueStr = value != null ? value.getValueString() : "";
+                    if (valueStr != null && valueStr.length() > captureVariablesMaxValueLength) {
+                        valueStr = valueStr.substring(0, captureVariablesMaxValueLength) + "...";
+                    }
+                    sb.append("\"value\":\"").append(esc(valueStr)).append("\"}");
+                    count++;
+                } catch (DebugException e) { /* skip this variable */ }
+            }
+            sb.append("}");
+            return count > 0 ? sb.toString() : null;
+        } catch (DebugException e) {
+            return null;
+        }
+    }
+
+    private static String esc(String s) {
+        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
     // --- Event handler (hot path — minimal work) ---
 
     @Override
@@ -185,10 +260,14 @@ public class TracerListener implements IDebugEventSetListener {
                     } catch (Exception e) { /* skip module capture errors */ }
                 }
 
+                // Capture variables (1.2)
+                String variablesJson = captureVariables(frame);
+
                 // Capture raw data
                 StepEntry entry = new StepEntry(
                     frame.getName(), frame.getLineNumber(), module,
-                    System.identityHashCode(thread), System.currentTimeMillis());
+                    System.identityHashCode(thread), System.currentTimeMillis(),
+                    variablesJson);
                 totalSteps++;
 
                 // Offload to writer queue — non-blocking

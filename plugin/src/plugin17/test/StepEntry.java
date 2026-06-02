@@ -5,14 +5,21 @@ public record StepEntry(
     int line,
     String module,
     long threadId,
-    long timestamp
+    long timestamp,
+    String variablesJson  // nullable, JSON object or null
 ) {
     public String toJson() {
-        return "{\"procedure\":\"" + esc(procedure)
-            + "\",\"line\":" + line
-            + ",\"module\":\"" + esc(module)
-            + "\",\"thread_id\":" + threadId
-            + ",\"ts\":" + timestamp + "}";
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"procedure\":\"").append(esc(procedure))
+          .append("\",\"line\":").append(line)
+          .append(",\"module\":\"").append(esc(module))
+          .append("\",\"thread_id\":").append(threadId)
+          .append(",\"ts\":").append(timestamp);
+        if (variablesJson != null) {
+            sb.append(",\"variables\":").append(variablesJson);
+        }
+        sb.append("}");
+        return sb.toString();
     }
     private static String esc(String s) {
         return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
