@@ -9,6 +9,9 @@ public record StepEntry(
     long timestamp,
     int charStart,       // (1.4) frame.getCharStart()
     int charEnd,         // (1.4) frame.getCharEnd()
+    int stackDepth,      // (1.5) frames.length
+    int parentSeq,       // (1.5) seq of caller step (-1 if none)
+    String stackJson,    // (1.5) full stack as JSON array or null
     String variablesJson // nullable, JSON object or null
 ) {
     public String toJson() {
@@ -20,7 +23,12 @@ public record StepEntry(
           .append("\",\"thread_id\":").append(threadId)
           .append(",\"ts\":").append(timestamp)
           .append(",\"char_start\":").append(charStart)
-          .append(",\"char_end\":").append(charEnd);
+          .append(",\"char_end\":").append(charEnd)
+          .append(",\"stack_depth\":").append(stackDepth)
+          .append(",\"parent_seq\":").append(parentSeq);
+        if (stackJson != null) {
+            sb.append(",\"stack\":").append(stackJson);
+        }
         if (variablesJson != null) {
             sb.append(",\"variables\":").append(variablesJson);
         }

@@ -51,6 +51,16 @@ public class TracerListener implements IDebugEventSetListener {
     // Config: char position capture (1.4)
     private volatile boolean captureCharPositionEnabled = true;
 
+    // Config: call stack capture (1.5)
+    private volatile boolean captureCallStackEnabled = true;
+    private volatile int captureCallStackMaxDepth = 20;
+
+    // State: parentSeq tracking (1.5)
+    private int previousDepth = -1;
+    private int currentParentSeq = -1;
+    private final int[] lastStepAtDepth = new int[256];
+    private int currentSeq = 0;
+
     public void setOutputPath(String path) { this.outputPath = path; }
 
     public void setConfig(Properties props) {
@@ -75,12 +85,22 @@ public class TracerListener implements IDebugEventSetListener {
 
         captureCharPositionEnabled = Boolean.parseBoolean(
             props.getProperty("capture.charPosition.enabled", "true"));
+
+        captureCallStackEnabled = Boolean.parseBoolean(
+            props.getProperty("capture.callStack.enabled", "true"));
+        captureCallStackMaxDepth = Integer.parseInt(
+            props.getProperty("capture.callStack.maxDepth", "20"));
     }
 
     public void startRecording() {
         entries.clear();
         queue.clear();
         totalSteps = 0;
+        // Reset parentSeq tracking state (1.5)
+        previousDepth = -1;
+        currentParentSeq = -1;
+        currentSeq = 0;
+        for (int i = 0; i < 256; i++) lastStepAtDepth[i] = -1;
         recording.set(true);
         startWriter();
     }
@@ -246,6 +266,24 @@ public class TracerListener implements IDebugEventSetListener {
         return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
+    // --- Call stack capture helper (1.5) ---
+    private String captureCallStack(IStackFrame[] frames) {
+        if (!captureCallStackEnabled || frames == null || frames.length == 0) return null;
+        int limit = Math.min(frames.length, captureCallStackMaxDepth);
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < limit; i++) {
+            if (i > 0) sb.append(",");
+            try {
+                sb.append("{\"procedure\":\"").append(esc(frames[i].getName()))
+                  .append("\",\"line\":").append(frames[i].getLineNumber()).append("}");
+            } catch (DebugException e) {
+                sb.append("{\"procedure\":\"<error>\",\"line\":-1}");
+            }
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
     // --- Event handler (hot path — minimal work) ---
 
     @Override
@@ -286,11 +324,44 @@ public class TracerListener implements IDebugEventSetListener {
                 int charStart = captureCharPositionEnabled ? frame.getCharStart() : -1;
                 int charEnd = captureCharPositionEnabled ? frame.getCharEnd() : -1;
 
+                // Capture call stack + parentSeq (1.5)
+                int stackDepth = 1;
+                int parentSeq = -1;
+                String stackJson = null;
+
+                if (captureCallStackEnabled) {
+                    try {
+                        IStackFrame[] frames = thread.getStackFrames();
+                        stackDepth = frames.length;
+                        currentSeq++;
+
+                        // ParentSeq algorithm
+                        if (stackDepth > previousDepth) {
+                            // Step INTO: parent is last step at previous depth
+                            parentSeq = (previousDepth >= 0 && previousDepth < 256)
+                                ? lastStepAtDepth[previousDepth] : -1;
+                        } else if (stackDepth == previousDepth) {
+                            // Step OVER: same parent
+                            parentSeq = currentParentSeq;
+                        } else {
+                            // Step RETURN: parent is the step we returned to
+                            parentSeq = (stackDepth < 256) ? lastStepAtDepth[stackDepth] : -1;
+                        }
+
+                        currentParentSeq = parentSeq;
+                        if (stackDepth < 256) lastStepAtDepth[stackDepth] = currentSeq;
+                        previousDepth = stackDepth;
+
+                        stackJson = captureCallStack(frames);
+                    } catch (DebugException e) { /* skip stack capture */ }
+                }
+
                 // Capture raw data
                 StepEntry entry = new StepEntry(
                     frame.getName(), frame.getLineNumber(), module,
                     threadName, threadId, System.currentTimeMillis(),
-                    charStart, charEnd, variablesJson);
+                    charStart, charEnd, stackDepth, parentSeq, stackJson,
+                    variablesJson);
                 totalSteps++;
 
                 // Offload to writer queue — non-blocking
