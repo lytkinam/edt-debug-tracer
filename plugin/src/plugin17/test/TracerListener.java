@@ -60,6 +60,21 @@ public class TracerListener implements IDebugEventSetListener {
     private volatile boolean captureCallStackEnabled = true;
     private volatile int captureCallStackMaxDepth = 20;
 
+    // Config: dedup (P3.1)
+    private volatile boolean filterDedupEnabled = true;
+    private volatile long filterDedupWindowMs = 50;
+
+    // Config: filters (P3.2)
+    private volatile String filterIncludeModules = "";
+    private volatile String filterExcludeModules = "";
+    private volatile String filterIncludeProcedures = "";
+    private volatile String filterExcludeProcedures = "";
+
+    // Config: limits (P3.3)
+    private volatile int limitMaxEntries = 0;
+    private volatile long limitMaxDurationSeconds = 0;
+    private volatile String limitAction = "stop";
+
     // State: parentSeq tracking (1.5)
     private int previousDepth = -1;
     private int currentParentSeq = -1;
@@ -98,7 +113,31 @@ public class TracerListener implements IDebugEventSetListener {
             props.getProperty("capture.callStack.enabled", "true"));
         captureCallStackMaxDepth = Integer.parseInt(
             props.getProperty("capture.callStack.maxDepth", "20"));
+
+        // P3: dedup, filters, limits
+        filterDedupEnabled = Boolean.parseBoolean(
+            props.getProperty("filter.dedup.enabled", "true"));
+        filterDedupWindowMs = Long.parseLong(
+            props.getProperty("filter.dedup.window.ms", "50"));
+        filterIncludeModules = props.getProperty("filter.include.modules", "");
+        filterExcludeModules = props.getProperty("filter.exclude.modules", "");
+        filterIncludeProcedures = props.getProperty("filter.include.procedures", "");
+        filterExcludeProcedures = props.getProperty("filter.exclude.procedures", "");
+        limitMaxEntries = Integer.parseInt(
+            props.getProperty("limit.maxEntries", "0"));
+        limitMaxDurationSeconds = Long.parseLong(
+            props.getProperty("limit.maxDuration.seconds", "0"));
+        limitAction = props.getProperty("limit.action", "stop");
     }
+
+    // State: dedup tracking (P3.1)
+    private String lastProc = "";
+    private int lastLine = -1;
+    private int lastThreadId = -1;
+    private long lastTs = 0;
+
+    // State: recording start time (P3.3)
+    private long recordingStartTime = 0;
 
     public void startRecording() {
         entries.clear();
@@ -109,6 +148,9 @@ public class TracerListener implements IDebugEventSetListener {
         currentParentSeq = -1;
         currentSeq = 0;
         for (int i = 0; i < 256; i++) lastStepAtDepth[i] = -1;
+        // Reset P3 state
+        lastProc = ""; lastLine = -1; lastThreadId = -1; lastTs = 0;
+        recordingStartTime = System.currentTimeMillis();
 
         // Create SQLite session (P2)
         if (storage != null && (storageMode.equals("sqlite") || storageMode.equals("both"))) {
@@ -317,6 +359,54 @@ public class TracerListener implements IDebugEventSetListener {
         return sb.toString();
     }
 
+    // --- P3.2: Filter check ---
+    private boolean passesFilter(StepEntry entry) {
+        // Include modules filter
+        if (!filterIncludeModules.isEmpty()) {
+            boolean match = false;
+            for (String pattern : filterIncludeModules.split(",")) {
+                if (matchesGlob(entry.module(), pattern.trim())) { match = true; break; }
+            }
+            if (!match) return false;
+        }
+        // Exclude modules filter
+        if (!filterExcludeModules.isEmpty()) {
+            for (String pattern : filterExcludeModules.split(",")) {
+                if (matchesGlob(entry.module(), pattern.trim())) return false;
+            }
+        }
+        // Include procedures filter
+        if (!filterIncludeProcedures.isEmpty()) {
+            boolean match = false;
+            for (String pattern : filterIncludeProcedures.split(",")) {
+                if (matchesGlob(entry.procedure(), pattern.trim())) { match = true; break; }
+            }
+            if (!match) return false;
+        }
+        // Exclude procedures filter
+        if (!filterExcludeProcedures.isEmpty()) {
+            for (String pattern : filterExcludeProcedures.split(",")) {
+                if (matchesGlob(entry.procedure(), pattern.trim())) return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean matchesGlob(String value, String pattern) {
+        if (pattern.isEmpty()) return false;
+        if (pattern.equals("*")) return true;
+        if (pattern.startsWith("*") && pattern.endsWith("*")) {
+            return value.contains(pattern.substring(1, pattern.length() - 1));
+        }
+        if (pattern.startsWith("*")) {
+            return value.endsWith(pattern.substring(1));
+        }
+        if (pattern.endsWith("*")) {
+            return value.startsWith(pattern.substring(0, pattern.length() - 1));
+        }
+        return value.equals(pattern);
+    }
+
     // --- Event handler (hot path — minimal work) ---
 
     @Override
@@ -396,6 +486,50 @@ public class TracerListener implements IDebugEventSetListener {
                     charStart, charEnd, stackDepth, parentSeq, stackJson,
                     variablesJson);
                 totalSteps++;
+
+                // P3.1: Dedup check
+                if (filterDedupEnabled) {
+                    if (entry.procedure().equals(lastProc)
+                        && entry.line() == lastLine
+                        && entry.threadId() == lastThreadId
+                        && (entry.timestamp() - lastTs) < filterDedupWindowMs) {
+                        // Duplicate within window — skip recording but still step
+                        lastTs = entry.timestamp();
+                        if (autoStepping.get()) { doAutoStep(thread); }
+                        continue;
+                    }
+                }
+                lastProc = entry.procedure();
+                lastLine = entry.line();
+                lastThreadId = entry.threadId();
+                lastTs = entry.timestamp();
+
+                // P3.2: Filter check
+                if (!passesFilter(entry)) {
+                    if (autoStepping.get()) { doAutoStep(thread); }
+                    continue;
+                }
+
+                // P3.3: Limit check
+                if (limitMaxEntries > 0 && entries.size() >= limitMaxEntries) {
+                    if ("stop".equals(limitAction)) {
+                        recording.set(false);
+                        autoStepping.set(false);
+                        System.out.println("[tracer] Limit reached: " + limitMaxEntries + " entries");
+                        break;
+                    }
+                }
+                if (limitMaxDurationSeconds > 0) {
+                    long elapsed = (System.currentTimeMillis() - recordingStartTime) / 1000;
+                    if (elapsed >= limitMaxDurationSeconds) {
+                        if ("stop".equals(limitAction)) {
+                            recording.set(false);
+                            autoStepping.set(false);
+                            System.out.println("[tracer] Duration limit: " + elapsed + "s");
+                            break;
+                        }
+                    }
+                }
 
                 // Queue to SQLite storage (P2)
                 if (storage != null && currentSessionId != null) {

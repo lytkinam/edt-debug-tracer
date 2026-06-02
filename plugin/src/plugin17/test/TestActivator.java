@@ -101,6 +101,26 @@ public class TestActivator implements BundleActivator {
                 + ",\"file\":\"" + esc(outputPath) + "\"}");
         });
 
+        // P3.4: Status endpoint
+        server.createContext("/mcp/status", ex -> {
+            StringBuilder sb = new StringBuilder("{");
+            sb.append("\"ok\":true");
+            sb.append(",\"recording\":").append(tracer.isRecording());
+            sb.append(",\"autoStepping\":").append(tracer.isAutoStepping());
+            sb.append(",\"entries\":").append(tracer.size());
+            sb.append(",\"totalSteps\":").append(tracer.getTotalSteps());
+            sb.append(",\"port\":").append(port);
+            sb.append(",\"storage\":\"").append(props.getProperty("storage.mode", "both")).append("\"");
+            if (storage != null && storage.isOpen()) {
+                sb.append(",\"sqlite\":true");
+                sb.append(",\"sessions\":").append(storage.getSessionCount());
+            } else {
+                sb.append(",\"sqlite\":false");
+            }
+            sb.append("}");
+            respond(ex, 200, sb.toString());
+        });
+
         server.setExecutor(null);
         server.start();
         System.out.println("[tracer] Active on :" + port + ", workspace: " + workspacePath);
