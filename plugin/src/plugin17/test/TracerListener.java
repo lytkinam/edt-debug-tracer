@@ -4,13 +4,16 @@ import org.eclipse.debug.core.DebugEvent;
 import org.eclipse.debug.core.IDebugEventSetListener;
 import org.eclipse.debug.core.DebugException;
 import org.eclipse.debug.core.DebugPlugin;
+import org.eclipse.debug.core.ILaunch;
 import org.eclipse.debug.core.model.IStackFrame;
 import org.eclipse.debug.core.model.IThread;
 import org.eclipse.debug.core.model.IDebugTarget;
+import org.eclipse.debug.core.model.ISourceLocator;
 import java.io.FileWriter;
 import java.io.File;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Properties;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -28,7 +31,17 @@ public class TracerListener implements IDebugEventSetListener {
     private Thread writerThread;
     private volatile String outputPath;
 
+    // Config: module capture (1.1)
+    private volatile boolean captureModuleEnabled = true;
+    private volatile String captureModuleFallback = "";
+
     public void setOutputPath(String path) { this.outputPath = path; }
+
+    public void setConfig(Properties props) {
+        captureModuleEnabled = Boolean.parseBoolean(
+            props.getProperty("capture.module.enabled", "true"));
+        captureModuleFallback = props.getProperty("capture.module.fallback", "");
+    }
 
     public void startRecording() {
         entries.clear();
@@ -157,9 +170,24 @@ public class TracerListener implements IDebugEventSetListener {
                 IStackFrame frame = thread.getTopStackFrame();
                 if (frame == null) continue;
 
-                // Capture raw data — fast
+                // Capture module via ISourceLocator (1.1)
+                String module = captureModuleFallback;
+                if (captureModuleEnabled) {
+                    try {
+                        ILaunch launch = thread.getLaunch();
+                        if (launch != null) {
+                            ISourceLocator locator = launch.getSourceLocator();
+                            if (locator != null) {
+                                Object src = locator.getSourceElement(frame);
+                                if (src != null) module = src.toString();
+                            }
+                        }
+                    } catch (Exception e) { /* skip module capture errors */ }
+                }
+
+                // Capture raw data
                 StepEntry entry = new StepEntry(
-                    frame.getName(), frame.getLineNumber(), "",
+                    frame.getName(), frame.getLineNumber(), module,
                     System.identityHashCode(thread), System.currentTimeMillis());
                 totalSteps++;
 

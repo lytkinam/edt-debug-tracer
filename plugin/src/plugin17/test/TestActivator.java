@@ -41,6 +41,7 @@ public class TestActivator implements BundleActivator {
 
         tracer = new TracerListener();
         tracer.setOutputPath(outputPath);
+        tracer.setConfig(props);
         DebugPlugin.getDefault().addDebugEventListener(tracer);
 
         server = HttpServer.create(new java.net.InetSocketAddress("localhost", port), 0);
