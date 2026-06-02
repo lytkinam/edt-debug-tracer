@@ -48,6 +48,9 @@ public class TracerListener implements IDebugEventSetListener {
     private volatile boolean captureThreadUseName = true;
     private volatile boolean captureThreadIncludeId = true;
 
+    // Config: char position capture (1.4)
+    private volatile boolean captureCharPositionEnabled = true;
+
     public void setOutputPath(String path) { this.outputPath = path; }
 
     public void setConfig(Properties props) {
@@ -69,6 +72,9 @@ public class TracerListener implements IDebugEventSetListener {
             props.getProperty("capture.thread.useName", "true"));
         captureThreadIncludeId = Boolean.parseBoolean(
             props.getProperty("capture.thread.includeId", "true"));
+
+        captureCharPositionEnabled = Boolean.parseBoolean(
+            props.getProperty("capture.charPosition.enabled", "true"));
     }
 
     public void startRecording() {
@@ -276,11 +282,15 @@ public class TracerListener implements IDebugEventSetListener {
                 String threadName = captureThreadUseName ? thread.getName() : "";
                 int threadId = captureThreadIncludeId ? System.identityHashCode(thread) : 0;
 
+                // Capture char position (1.4)
+                int charStart = captureCharPositionEnabled ? frame.getCharStart() : -1;
+                int charEnd = captureCharPositionEnabled ? frame.getCharEnd() : -1;
+
                 // Capture raw data
                 StepEntry entry = new StepEntry(
                     frame.getName(), frame.getLineNumber(), module,
                     threadName, threadId, System.currentTimeMillis(),
-                    variablesJson);
+                    charStart, charEnd, variablesJson);
                 totalSteps++;
 
                 // Offload to writer queue — non-blocking

@@ -7,6 +7,8 @@ public record StepEntry(
     String threadName,   // (1.3) thread.getName()
     int threadId,        // identityHashCode (optional)
     long timestamp,
+    int charStart,       // (1.4) frame.getCharStart()
+    int charEnd,         // (1.4) frame.getCharEnd()
     String variablesJson // nullable, JSON object or null
 ) {
     public String toJson() {
@@ -16,7 +18,9 @@ public record StepEntry(
           .append(",\"module\":\"").append(esc(module))
           .append("\",\"thread_name\":\"").append(esc(threadName))
           .append("\",\"thread_id\":").append(threadId)
-          .append(",\"ts\":").append(timestamp);
+          .append(",\"ts\":").append(timestamp)
+          .append(",\"char_start\":").append(charStart)
+          .append(",\"char_end\":").append(charEnd);
         if (variablesJson != null) {
             sb.append(",\"variables\":").append(variablesJson);
         }
