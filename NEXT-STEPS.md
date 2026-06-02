@@ -664,16 +664,233 @@ research.1cProtocol.port=1550
 research.1cProtocol.compareMode=side-by-side
 ```
 
-### B. Call tree reconstruction
+### B. Иерархия вызовов и граф зависимостей
 
-Из flat-треса восстановить дерево вызовов.
+#### Концепция
 
-**Конфигурация:**
+Текущий трейс — **flat**: каждый шаг это `(seq, procedure, line)`. Нет информации о том, **кто вызвал** текущую процедуру. Для построения дерева вызовов и графа зависимостей нужно на каждом шаге захватывать **полный стек фреймов** и определять **родителя**.
+
+#### Как это работает (видение)
+
+**Шаг 1: Захват полного стека на каждом SUSPEND**
+
+```java
+IStackFrame[] frames = thread.getStackFrames();
+// frames[0] = текущий фрейм (top)
+// frames[1] = вызвавший (caller)
+// frames[2] = вызвавший вызвавшего
+// ...
+```
+
+На каждом шаге сохраняем не только top frame, а весь стек:
+
+```json
+{
+  "seq": 42,
+  "procedure": "ОбщийМодуль.СтандартныеПодсистемыСервер.Модуль.УстановкаПараметровСеанса",
+  "line": 47,
+  "stackDepth": 3,
+  "parentSeq": 18,
+  "stack": [
+    {"procedure": "ОбщийМодуль.СтандартныеПодсистемыСервер.Модуль.УстановкаПараметровСеанса", "line": 47},
+    {"procedure": "МодульСеанса.УстановкаПараметровСеанса", "line": 19},
+    {"procedure": "<EntryPoint>", "line": 0}
+  ]
+}
+```
+
+**Шаг 2: Определение parentSeq**
+
+`parentSeq` — это seq шага, который **вызвал** текущую процедуру. Определяется по изменению глубины стека:
+
+```
+seq=18: stackDepth=2, procedure=МодульСеанса.УстановкаПараметровСеанса:19
+seq=19: stackDepth=2, procedure=МодульСеанса.УстановкаПараметровСеанса:19  (step over, same depth)
+seq=20: stackDepth=3, procedure=СтандартныеПодсистемыСервер:45  (step into, depth increased)
+  → parentSeq = 19 (последний шаг с меньшей глубиной)
+seq=21: stackDepth=3, procedure=СтандартныеПодсистемыСервер:46  (step over, same depth)
+  → parentSeq = 19 (тот же родитель)
+seq=35: stackDepth=2, procedure=МодульСеанса:16  (return, depth decreased)
+  → parentSeq = null (вернулись, новый контекст)
+```
+
+**Алгоритм:**
+```java
+// В TracerListener, при каждом SUSPEND:
+int currentDepth = frames.length;
+int parentSeq = -1;
+
+if (currentDepth > previousDepth) {
+    // Step INTO: родитель — последний шаг с меньшей глубиной
+    parentSeq = lastStepAtDepth[currentDepth - 1];
+} else if (currentDepth == previousDepth) {
+    // Step OVER: тот же родитель
+    parentSeq = currentParentSeq;
+} else {
+    // Step RETURN: родитель — шаг на который вернулись
+    parentSeq = lastStepAtDepth[currentDepth];
+}
+
+// Обновить стек глубин
+lastStepAtDepth[currentDepth] = currentSeq;
+```
+
+**Шаг 3: Построение графа из сырых данных**
+
+После остановки записи, из сырых шагов строится:
+
+**Call tree** (дерево вызовов):
+```
+<EntryPoint>
+  └── МодульСеанса.УстановкаПараметровСеанса:16  [seq=1]
+        └── СтандартныеПодсистемыСервер:45  [seq=3]
+              ├── :46  [seq=4]
+              ├── :47  [seq=5] (loop ×3)
+              ├── :49  [seq=8]
+              └── :61  [seq=16]
+        └── ОбработкаНовостейСлужебный:177  [seq=19]
+              ├── :178  [seq=20]
+              └── :199  [seq=30]
+```
+
+**Dependency graph** (граф зависимостей модулей):
+```
+МодульСеанса → СтандартныеПодсистемыСервер (14 calls)
+МодульСеанса → ОбработкаНовостейСлужебный (12 calls)
+СтандартныеПодсистемыСервер → СтандартныеПодсистемыПовтИсп (3 calls)
+```
+
+**Шаг 4: Запросы к MySQL**
+
+С `parentSeq` в сырых данных становятся возможны SQL-запросы:
+
+```sql
+-- Все вызовы процедуры X
+SELECT s.* FROM tracer_steps s
+WHERE s.session_id = ? AND s.parentSeq IN (
+    SELECT seq FROM tracer_steps WHERE procedure_name LIKE '%УстановкаПараметровСеанса%'
+)
+
+-- Глубина вызова для каждого шага
+SELECT seq, procedure_name, line, stackDepth,
+       (SELECT procedure_name FROM tracer_steps p WHERE p.seq = s.parentSeq) AS caller
+FROM tracer_steps s WHERE session_id = ?
+
+-- Граф зависимостей (кто кого вызывает и сколько раз)
+SELECT caller.procedure_name AS from_proc,
+       callee.procedure_name AS to_proc,
+       COUNT(*) AS call_count
+FROM tracer_steps callee
+JOIN tracer_steps caller ON caller.seq = callee.parentSeq
+WHERE callee.session_id = ?
+GROUP BY from_proc, to_proc
+ORDER BY call_count DESC
+```
+
+#### Влияние на производительность
+
+Захват полного стека (`thread.getStackFrames()`) дороже чем только top frame:
+
+| Операция | Top frame only | Full stack (depth=3) | Full stack (depth=10) |
+|----------|---------------|---------------------|----------------------|
+| Чтение фреймов | ~1μs | ~5μs | ~15μs |
+| Общий hot path | ~12μs | ~16μs | ~26μs |
+| Шагов/сек (BSL) | ~7 | ~6.5 | ~6 |
+
+**Вывод:** влияние минимально (~10-15% slowdown при depth≤5), потому что основное время — BSL debug engine (~140ms/step), а не чтение стека.
+
+#### MySQL schema (дополнение)
+
+```sql
+ALTER TABLE tracer_steps ADD COLUMN stack_depth INT DEFAULT 0;
+ALTER TABLE tracer_steps ADD COLUMN parent_seq BIGINT DEFAULT NULL;
+ALTER TABLE tracer_steps ADD COLUMN stack_json TEXT;
+
+CREATE INDEX idx_parent ON tracer_steps(session_id, parent_seq);
+CREATE INDEX idx_depth ON tracer_steps(session_id, stack_depth);
+```
+
+#### Конфигурация
+
 ```properties
+capture.callStack.enabled=true
+capture.callStack.maxDepth=10
+capture.callStack.trackParent=true
+capture.callStack.storeFullStack=true
+
 analysis.callTree.enabled=true
 analysis.callTree.detectRecursion=true
-analysis.callTree.maxDepth=50
 analysis.callTree.groupLoops=true
+analysis.callTree.output.format=json
+analysis.callTree.output.path={workspace}/.edt-debug-tracer/calltree.json
+
+analysis.dependencyGraph.enabled=true
+analysis.dependencyGraph.groupBy=module
+analysis.dependencyGraph.minCalls=1
+analysis.dependencyGraph.output.format=json
+analysis.dependencyGraph.output.path={workspace}/.edt-debug-tracer/deps.json
+```
+
+| Параметр | Тип | По умолчанию | Описание |
+|----------|-----|-------------|----------|
+| `capture.callStack.enabled` | boolean | `true` | Захватывать полный стек |
+| `capture.callStack.maxDepth` | int | `10` | Максимальная глубина (0 = без лимита) |
+| `capture.callStack.trackParent` | boolean | `true` | Вычислять parentSeq |
+| `capture.callStack.storeFullStack` | boolean | `true` | Сохранять весь стек в stack_json |
+| `analysis.callTree.enabled` | boolean | `true` | Строить call tree при пост-обработке |
+| `analysis.callTree.detectRecursion` | boolean | `true` | Детектировать рекурсию |
+| `analysis.callTree.groupLoops` | boolean | `true` | Сворачивать циклы в один узел |
+| `analysis.callTree.output.format` | string | `json` | Формат: `json`, `dot` (Graphviz), `html` |
+| `analysis.callTree.output.path` | string | `calltree.json` | Путь к файлу |
+| `analysis.dependencyGraph.enabled` | boolean | `true` | Строить граф зависимостей |
+| `analysis.dependencyGraph.groupBy` | string | `module` | Группировка: `module`, `procedure`, `file` |
+| `analysis.dependencyGraph.minCalls` | int | `1` | Минимум вызовов для включения в граф |
+| `analysis.dependencyGraph.output.format` | string | `json` | Формат: `json`, `dot`, `html`, `cytoscape` |
+| `analysis.dependencyGraph.output.path` | string | `deps.json` | Путь к файлу |
+
+#### Форматы вывода
+
+**JSON (call tree):**
+```json
+{
+  "procedure": "МодульСеанса.УстановкаПараметровСеанса",
+  "line": 16,
+  "seq": 1,
+  "children": [
+    {
+      "procedure": "СтандартныеПодсистемыСервер.УстановкаПараметровСеанса",
+      "line": 45,
+      "seq": 3,
+      "callCount": 1,
+      "children": [
+        {"procedure": "...:46", "seq": 4, "children": []},
+        {"procedure": "...:47", "seq": 5, "loopCount": 3, "children": []}
+      ]
+    }
+  ]
+}
+```
+
+**Graphviz DOT (dependency graph):**
+```dot
+digraph dependencies {
+    "МодульСеанса" -> "СтандартныеПодсистемыСервер" [label="14"];
+    "МодульСеанса" -> "ОбработкаНовостейСлужебный" [label="12"];
+    "СтандартныеПодсистемыСервер" -> "СтандартныеПодсистемыПовтИсп" [label="3"];
+}
+```
+
+**Cytoscape JSON (для веб-визуализации):**
+```json
+{
+  "nodes": [
+    {"data": {"id": "МодульСеанса", "steps": 2, "type": "module"}},
+    {"data": {"id": "СтандартныеПодсистемыСервер", "steps": 14, "type": "module"}}
+  ],
+  "edges": [
+    {"data": {"source": "МодульСеанса", "target": "СтандартныеПодсистемыСервер", "calls": 14}}
+  ]
+}
 ```
 
 ### C. Diff-трейс
@@ -728,12 +945,12 @@ multiSession.output.dir={workspace}/.edt-debug-tracer/sessions/
 | Раздел | Префикс | Параметров | Описание |
 |--------|---------|-----------|----------|
 | Server | `server.*` | 8 | HTTP server, auth, CORS |
-| Capture | `capture.*` | 10 | Данные для захвата (module, variables, thread, callStack) |
+| Capture | `capture.*` | 14 | Данные для захвата (module, variables, thread, callStack, parentSeq) |
 | Storage | `storage.*` | 17 | MySQL, SQLite, file, dual storage |
 | Filter | `filter.*` | 10 | Дедупликация, include/exclude |
 | Limit | `limit.*` | 3 | Лимиты записей и длительности |
 | AutoStep | `autoStep.*` | 14 | Параметры auto-step, условия, batch |
-| Analysis | `analysis.*` | 13 | Пост-обработка, loop collapse, call tree, hot spots |
+| Analysis | `analysis.*` | 23 | Пост-обработка, loop collapse, call tree, dependency graph, hot spots |
 | Writer | `writer.*` | 4 | Buffer, flush, thread priority |
 | Reliability | `reliability.*` | 9 | Error handling, shutdown, retry |
 | Integration | `integration.*` | 4 | codepilot1c, webhook |
@@ -744,4 +961,4 @@ multiSession.output.dir={workspace}/.edt-debug-tracer/sessions/
 | Profiling | `profiling.*` | 3 | Hot path profiling |
 | Research | `research.*` | 5 | Экспериментальные фичи |
 | MultiSession | `multiSession.*` | 4 | Мульти-сессия |
-| **Итого** | | **~105** | |
+| **Итого** | | **~119** | |
