@@ -1,53 +1,81 @@
 # Update Summary
 
-## v3 — MCP Debug Control Server
+## v1.0 — Pipeline Tracer (текущая версия)
 
-### What changed
+### Что работает
 
-- Added `DebugService` — direct Eclipse Debug API access for live debug control
-- Added `WaitForBreakListener` — event-driven SUSPEND via `IDebugEventSetListener` + `CompletableFuture`
-- Added `McpJsonRpcHandler` — JSON-RPC 2.0 dispatcher with 8 MCP tools
-- Added 20 DTO records in `com.tracer.edt.mcp.dto`
-- Modified `McpHttpServer` — added `/mcp` JSON-RPC endpoint alongside REST
-- Modified `DebugTracerActivator` — wires DebugService + WaitForBreakListener + McpJsonRpcHandler
-- Added `scripts/build.sh` — CLI build without Eclipse PDE (javac + jar)
-- Added `site/` — p2 update site for EDT installation
-- Updated `MANIFEST.MF` — export `com.tracer.edt.debug`, `com.tracer.edt.mcp.dto`
-- Updated README, docs/02, docs/04
+- **TracerListener** (`IDebugEventSetListener`) — перехват SUSPEND-событий Eclipse Debug API
+- **Pipeline auto-step** — `thread.stepOver()` напрямую из event handler, запись через `BlockingQueue` в writer-thread
+- **HttpServer** (com.sun.net.httpserver) — REST API на настраиваемом порту
+- **Per-workspace конфигурация** — `{workspace}/.edt-debug-tracer/tracer.properties`
+- **Запись в файл** — JSON-массив `StepEntry[]` при `/mcp/stop`
+- **PDE JUnit тесты** — через AssistAI MCP `eclipse-pde` endpoint
 
-### New MCP tools (JSON-RPC 2.0 on `POST /mcp`)
+### Производительность
 
-| Tool | Description |
-|------|-------------|
-| `debug_status` | Current debug state |
-| `step` | Step into/over/out |
-| `resume` | Resume suspended thread |
-| `suspend` | Suspend running thread |
-| `wait_for_break` | Event-driven wait for SUSPEND |
-| `get_variables` | Stack frame variables + position |
-| `get_call_stack` | Full call stack for all threads |
-| `list_sessions` | Active debug sessions |
+- Pipeline: **192 steps/sec** на Java test app, **7 steps/sec** на реальном BSL (EDT)
+- 0% потерь шагов
+- Hot path: ~12μs (frame read + queue + stepOver)
 
-### Installation
+### API Endpoints
 
-p2 update site: `https://lytkinam.github.io/edt-debug-tracer/`
+| Endpoint | Метод | Описание |
+|----------|-------|----------|
+| `/mcp/health` | GET | Статус: ok, recording, autoStepping, entries, port |
+| `/mcp/start` | POST | Начать запись |
+| `/mcp/run` | POST | Auto-step: `{"steps": N}` |
+| `/mcp/stop` | POST | Остановить, сохранить в файл |
+
+### Файлы
+
+```
+plugin/src/plugin17/test/
+├── TestActivator.java       — BundleActivator + HttpServer + config reader
+├── TracerListener.java      — IDebugEventSetListener + pipeline auto-step
+├── StepEntry.java           — record(procedure, line, module, threadId, ts)
+├── McpHealthTest.java       — PDE JUnit: health endpoint
+└── TracerIntegrationTest.java — PDE JUnit: start/stop recording
+```
+
+### Конфигурация
+
+`{workspace}/.edt-debug-tracer/tracer.properties`:
+```properties
+port=18080
+output=~/.edt-debug-tracer/trace.json
+```
+
+### Установка
+
+1. Собрать jar (javac + jar)
+2. Скопировать в `$EDT_DIR/plugins/`
+3. Добавить в `bundles.info`
+4. Перезапустить EDT (без `-clean`)
+
+### Протестировано
+
+- ✅ Eclipse 2026-03 (port 18060, workspace-eclipse-latest)
+- ✅ EDT 2025.1.5 (port 18080, workspace-edt2025)
+- ✅ 30 шагов реального BSL-кода без потерь
+- ✅ PDE JUnit тесты (2/2 passed)
 
 ---
 
-## v2 — Async SQLite Pipeline
+## Предыдущие итерации (в git history)
 
-- Replaced in-memory `StepLogBuffer` with async SQLite pipeline
-- Added `AsyncTraceWriter` (queue + background thread)
-- Added `TraceRepository` (raw_trace + clean_trace tables)
-- Added `TraceSessionManager`
-- Added `LoopCollapser` (repeat collapse + pattern detection)
-- Added `CollapsedTraceEntry` with JSON serialization
-- Extended `McpHttpServer` with `/mcp/postprocess` and `/mcp/trace`
-- Added `plugin.tests/` PDE test project with 3 Java test classes
-- Added `docs/09_pde_test_project.md`
-- Added `docs/10_lib_checklist.md`
+### v0.3 — MCP Debug Control Server (не вошло в v1.0)
 
-### sqlite-jdbc dependency
+- DebugService с 8 JSON-RPC tools (debug_status, step, resume, suspend, wait_for_break, get_variables, get_call_stack, list_sessions)
+- 20 DTO records
+- McpJsonRpcHandler
+- Отложено: требует полной интеграции с Eclipse PDE build
 
-Download: https://github.com/xerial/sqlite-jdbc/releases/download/3.53.1.0/sqlite-jdbc-3.53.1.0.jar
-Place as: plugin/lib/sqlite-jdbc.jar AND plugin.tests/lib/sqlite-jdbc.jar
+### v0.2 — Event-driven auto-step
+- stepOver через `new Thread()` — 48 steps/sec
+- Pipeline (direct stepOver) — 192 steps/sec
+- Выявлен threading: stepOver не работает из event dispatch thread
+
+### v0.1 — Minimal plugin
+- BundleActivator + HttpServer + /mcp/health, /mcp/start, /mcp/stop
+- In-memory `CopyOnWriteArrayList`
+- Доказательство загрузки OSGi бандла в Eclipse 2026-03 и EDT
