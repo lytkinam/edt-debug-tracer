@@ -142,6 +142,104 @@ curl -X POST "$BASE/eclipse-pde" \
 
 ---
 
+## Скрипты запуска
+
+Все скрипты находятся в `scripts/` директории проекта. Каждый скрипт поддерживает команды: `start`, `stop`, `restart`, `status`, `log`.
+
+### Eclipse 2026-03 (dev/test) — `scripts/eclipse-launch.sh`
+
+```bash
+# Запустить Eclipse на DISPLAY :1 с workspace-eclipse-latest
+./scripts/eclipse-launch.sh start
+
+# Остановить
+./scripts/eclipse-launch.sh stop
+
+# Перезапустить
+./scripts/eclipse-launch.sh restart
+
+# Проверить статус (процесс, порты 18060/8124)
+./scripts/eclipse-launch.sh status
+
+# Показать последние логи
+./scripts/eclipse-launch.sh log
+```
+
+**Переменные окружения:**
+
+| Переменная | По умолчанию | Описание |
+|------------|-------------|----------|
+| `ECLIPSE_DIR` | `/opt/eclipse-latest` | Путь к установке Eclipse |
+| `ECLIPSE_WORKSPACE` | `/home/ai/workspace-eclipse-latest` | Workspace |
+| `ECLIPSE_DISPLAY` | `:1` | X Display (VNC) |
+
+**Порты:** tracer на 18060, AssistAI MCP на 8124.
+
+### EDT 2025.1.5 (production) — `scripts/edt-launch.sh`
+
+```bash
+# Запустить EDT на DISPLAY :1 с workspace-edt2025
+./scripts/edt-launch.sh start
+
+# Остановить (graceful → force kill)
+./scripts/edt-launch.sh stop
+
+# Перезапустить
+./scripts/edt-launch.sh restart
+
+# Проверить статус (процесс, порты 8765/18080, lock file)
+./scripts/edt-launch.sh status
+
+# Показать последние логи и ошибки
+./scripts/edt-launch.sh log
+```
+
+**Переменные окружения:**
+
+| Переменная | По умолчанию | Описание |
+|------------|-------------|----------|
+| `EDT_DIR` | `/opt/1C/1CE/components/1c-edt-2025.1.5+34-x86_64` | Путь к EDT |
+| `EDT_WORKSPACE` | `/home/ai/workspace-edt2025` | Workspace |
+| `EDT_DISPLAY` | `:1` | X Display (VNC) |
+
+**Порты:** codepilot1c MCP на 8765, tracer на 18080.
+
+**ВАЖНО:** Никогда не перезапускать EDT с флагом `-clean` — ломается secure storage.
+
+### Сборка — `scripts/build.sh`
+
+```bash
+# Собрать jar (javac + jar)
+./scripts/build.sh
+
+# Собрать и установить в Eclipse
+./scripts/build.sh --install
+
+# Очистить артефакты
+./scripts/build.sh --clean
+```
+
+### Настройка окружения — `scripts/setup_dev_env.sh`
+
+```bash
+# Скачать sqlite-jdbc, настроить classpath
+./scripts/setup_dev_env.sh
+```
+
+### Быстрый чек всего окружения
+
+```bash
+# Статус обоих Eclipse
+./scripts/eclipse-launch.sh status
+./scripts/edt-launch.sh status
+
+# Или одной командой:
+echo "=== Eclipse ===" && ./scripts/eclipse-launch.sh status
+echo "=== EDT ===" && ./scripts/edt-launch.sh status
+```
+
+---
+
 ## Деплой
 
 ### В Eclipse 2026-03 (dev/test)
