@@ -44,6 +44,10 @@ public class TracerListener implements IDebugEventSetListener {
     private volatile int captureVariablesMaxValueLength = 200;
     private volatile String captureVariablesExcludeNames = "";
 
+    // Config: thread name capture (1.3)
+    private volatile boolean captureThreadUseName = true;
+    private volatile boolean captureThreadIncludeId = true;
+
     public void setOutputPath(String path) { this.outputPath = path; }
 
     public void setConfig(Properties props) {
@@ -60,6 +64,11 @@ public class TracerListener implements IDebugEventSetListener {
         captureVariablesMaxValueLength = Integer.parseInt(
             props.getProperty("capture.variables.maxValueLength", "200"));
         captureVariablesExcludeNames = props.getProperty("capture.variables.excludeNames", "");
+
+        captureThreadUseName = Boolean.parseBoolean(
+            props.getProperty("capture.thread.useName", "true"));
+        captureThreadIncludeId = Boolean.parseBoolean(
+            props.getProperty("capture.thread.includeId", "true"));
     }
 
     public void startRecording() {
@@ -263,10 +272,14 @@ public class TracerListener implements IDebugEventSetListener {
                 // Capture variables (1.2)
                 String variablesJson = captureVariables(frame);
 
+                // Capture thread info (1.3)
+                String threadName = captureThreadUseName ? thread.getName() : "";
+                int threadId = captureThreadIncludeId ? System.identityHashCode(thread) : 0;
+
                 // Capture raw data
                 StepEntry entry = new StepEntry(
                     frame.getName(), frame.getLineNumber(), module,
-                    System.identityHashCode(thread), System.currentTimeMillis(),
+                    threadName, threadId, System.currentTimeMillis(),
                     variablesJson);
                 totalSteps++;
 
