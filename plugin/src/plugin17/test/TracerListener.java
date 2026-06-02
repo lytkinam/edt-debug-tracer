@@ -75,6 +75,17 @@ public class TracerListener implements IDebugEventSetListener {
     private volatile long limitMaxDurationSeconds = 0;
     private volatile String limitAction = "stop";
 
+    // Config: auto-step (P4.1)
+    private volatile int autoStepDefaultSteps = 1000;
+    private volatile int autoStepMaxSteps = 100000;
+    private volatile long autoStepDelayMs = 0;
+    private volatile String autoStepStepType = "over";
+    private volatile boolean autoStepStopOnTerminate = true;
+    private volatile boolean autoStepStopOnException = false;
+    private volatile String autoStepStopOnModule = "";
+    private volatile String autoStepStopOnProcedure = "";
+    private volatile int autoStepStopOnLine = 0;
+
     // State: parentSeq tracking (1.5)
     private int previousDepth = -1;
     private int currentParentSeq = -1;
@@ -128,6 +139,23 @@ public class TracerListener implements IDebugEventSetListener {
         limitMaxDurationSeconds = Long.parseLong(
             props.getProperty("limit.maxDuration.seconds", "0"));
         limitAction = props.getProperty("limit.action", "stop");
+
+        // P4: auto-step params
+        autoStepDefaultSteps = Integer.parseInt(
+            props.getProperty("autoStep.defaultSteps", "1000"));
+        autoStepMaxSteps = Integer.parseInt(
+            props.getProperty("autoStep.maxSteps", "100000"));
+        autoStepDelayMs = Long.parseLong(
+            props.getProperty("autoStep.delay.ms", "0"));
+        autoStepStepType = props.getProperty("autoStep.stepType", "over");
+        autoStepStopOnTerminate = Boolean.parseBoolean(
+            props.getProperty("autoStep.stopOnTerminate", "true"));
+        autoStepStopOnException = Boolean.parseBoolean(
+            props.getProperty("autoStep.stopOnException", "false"));
+        autoStepStopOnModule = props.getProperty("autoStep.stopOnModule", "");
+        autoStepStopOnProcedure = props.getProperty("autoStep.stopOnProcedure", "");
+        autoStepStopOnLine = Integer.parseInt(
+            props.getProperty("autoStep.stopOnLine", "0"));
     }
 
     // State: dedup tracking (P3.1)
@@ -189,6 +217,9 @@ public class TracerListener implements IDebugEventSetListener {
     }
 
     public void startAutoStep(int maxSteps) {
+        // P4.1: use default if 0, cap at maxSteps
+        if (maxSteps <= 0) maxSteps = autoStepDefaultSteps;
+        maxSteps = Math.min(maxSteps, autoStepMaxSteps);
         stepsRemaining.set(maxSteps);
         autoStepping.set(true);
         new Thread(() -> {
@@ -206,9 +237,23 @@ public class TracerListener implements IDebugEventSetListener {
     private void doAutoStep(IThread thread) {
         if (autoStepping.get() && stepsRemaining.getAndDecrement() > 0) {
             try {
-                thread.stepOver();
+                // P4.1: delay between steps
+                if (autoStepDelayMs > 0) {
+                    Thread.sleep(autoStepDelayMs);
+                }
+                // P4.1: step type
+                switch (autoStepStepType) {
+                    case "into": thread.stepInto(); break;
+                    case "return": thread.stepReturn(); break;
+                    default: thread.stepOver(); break;
+                }
             } catch (DebugException e) {
-                autoStepping.set(false);
+                if (autoStepStopOnException) {
+                    autoStepping.set(false);
+                    System.out.println("[tracer] auto-step stopped on exception");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
         } else if (autoStepping.get()) {
             autoStepping.set(false);
@@ -546,10 +591,61 @@ public class TracerListener implements IDebugEventSetListener {
 
             } catch (Exception e) { /* skip */ }
 
-            // Step immediately — no thread creation overhead
+            // P4.1: Check stopOn conditions before stepping
             if (autoStepping.get()) {
-                doAutoStep(thread);
+                IStackFrame topFrame = null;
+                try { topFrame = thread.getTopStackFrame(); } catch (Exception e) { /* skip */ }
+                if (topFrame != null) {
+                    boolean shouldStop = false;
+                    if (!autoStepStopOnModule.isEmpty()
+                        && matchesGlob(getFrameModule(topFrame), autoStepStopOnModule)) {
+                        shouldStop = true;
+                    }
+                    if (!autoStepStopOnProcedure.isEmpty()
+                        && matchesGlob(getFrameProcedure(topFrame), autoStepStopOnProcedure)) {
+                        shouldStop = true;
+                    }
+                    if (autoStepStopOnLine > 0) {
+                        try { if (topFrame.getLineNumber() == autoStepStopOnLine) shouldStop = true; }
+                        catch (Exception e) { /* skip */ }
+                    }
+                    if (shouldStop) {
+                        autoStepping.set(false);
+                        System.out.println("[tracer] auto-step stopped on condition");
+                    }
+                }
+                // Also check TERMINATE
+                if (autoStepStopOnTerminate) {
+                    for (DebugEvent termEvent : events) {
+                        if (termEvent.getKind() == DebugEvent.TERMINATE) {
+                            autoStepping.set(false);
+                            System.out.println("[tracer] auto-step stopped on TERMINATE");
+                        }
+                    }
+                }
+                if (autoStepping.get()) {
+                    doAutoStep(thread);
+                }
             }
         }
+    }
+
+    private String getFrameModule(IStackFrame frame) {
+        if (!captureModuleEnabled) return captureModuleFallback;
+        try {
+            ILaunch launch = frame.getLaunch();
+            if (launch != null) {
+                ISourceLocator locator = launch.getSourceLocator();
+                if (locator != null) {
+                    Object src = locator.getSourceElement(frame);
+                    if (src != null) return src.toString();
+                }
+            }
+        } catch (Exception e) { /* skip */ }
+        return captureModuleFallback;
+    }
+
+    private String getFrameProcedure(IStackFrame frame) {
+        try { return frame.getName(); } catch (Exception e) { return ""; }
     }
 }
