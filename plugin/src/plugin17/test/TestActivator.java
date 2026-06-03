@@ -150,17 +150,21 @@ public class TestActivator implements BundleActivator {
         // Breakpoint management endpoints
         server.createContext("/mcp/breakpoints/set", ex -> {
             if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
-            String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-            String mode = "start";
-            int idx = body.indexOf("\"mode\"");
-            if (idx >= 0) {
-                int q1 = body.indexOf('"', idx + 6);
-                int q2 = body.indexOf('"', q1 + 1);
-                if (q1 >= 0 && q2 > q1) mode = body.substring(q1 + 1, q2);
+            try {
+                String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                String mode = "start";
+                int idx = body.indexOf("\"mode\"");
+                if (idx >= 0) {
+                    int q1 = body.indexOf('"', idx + 6);
+                    int q2 = body.indexOf('"', q1 + 1);
+                    if (q1 >= 0 && q2 > q1) mode = body.substring(q1 + 1, q2);
+                }
+                java.util.List<StepEntry> entries = tracer.getEntries();
+                int count = breakpoints.setFromTrace(entries, mode);
+                respond(ex, 200, "{\"set\":" + count + ",\"mode\":\"" + mode + "\"}");
+            } catch (Exception e) {
+                respond(ex, 500, "{\"error\":\"" + e.getClass().getSimpleName() + ": " + e.getMessage().replace("\"", "'") + "\"}");
             }
-            java.util.List<StepEntry> entries = tracer.getEntries();
-            int count = breakpoints.setFromTrace(entries, mode);
-            respond(ex, 200, "{\"set\":" + count + ",\"mode\":\"" + mode + "\"}");
         });
 
         server.createContext("/mcp/breakpoints/clear", ex -> {

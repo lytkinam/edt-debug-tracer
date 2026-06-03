@@ -6,33 +6,72 @@ import org.eclipse.core.resources.IResource;
 import org.eclipse.core.resources.IWorkspaceRoot;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
-import org.eclipse.debug.core.DebugPlugin;
+import org.eclipse.core.runtime.Platform;
 import org.eclipse.debug.core.model.IBreakpoint;
-import org.eclipse.jdt.debug.core.IJavaLineBreakpoint;
-import org.eclipse.jdt.debug.core.JDIDebugModel;
+import org.osgi.framework.Bundle;
 
+import java.lang.reflect.Method;
 import java.util.*;
 
 /**
- * Manages breakpoints created from trace data (P10).
- * Can set breakpoints at the start or end of each procedure visited during tracing.
+ * Manages breakpoints created from trace data.
+ * Uses reflective class loading for JDIDebugModel to avoid OSGi NoClassDefFoundError.
  */
 public class TracerBreakpoints {
 
     private final List<IBreakpoint> managedBreakpoints = new ArrayList<>();
+    private Method createLineBreakpointMethod;
+    private boolean jdtDebugAvailable = false;
+
+    public TracerBreakpoints() {
+        initJdtDebug();
+    }
+
+    /**
+     * Initialize JDT Debug API via bundle classloader.
+     */
+    private void initJdtDebug() {
+        try {
+            Bundle bundle = Platform.getBundle("org.eclipse.jdt.debug");
+            if (bundle == null) {
+                System.err.println("[tracer] org.eclipse.jdt.debug bundle not found");
+                return;
+            }
+            int state = bundle.getState();
+            System.out.println("[tracer] org.eclipse.jdt.debug state: " + state
+                + " (INSTALLED=2, RESOLVED=4, STARTING=8, STOPPING=16, ACTIVE=32)");
+
+            // Start bundle if not active
+            if (state != Bundle.ACTIVE) {
+                System.out.println("[tracer] Starting org.eclipse.jdt.debug bundle...");
+                bundle.start(Bundle.START_ACTIVATION_POLICY);
+                System.out.println("[tracer] Bundle state after start: " + bundle.getState());
+            }
+
+            // Load class via bundle classloader
+            Class<?> modelClass = bundle.loadClass("org.eclipse.jdt.debug.core.JDIDebugModel");
+            createLineBreakpointMethod = modelClass.getMethod("createLineBreakpoint",
+                IResource.class, String.class, int.class, int.class, int.class, int.class, boolean.class, Map.class);
+            jdtDebugAvailable = true;
+            System.out.println("[tracer] JDIDebugModel loaded successfully via bundle classloader");
+        } catch (Exception e) {
+            System.err.println("[tracer] JDT Debug init failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            jdtDebugAvailable = false;
+        }
+    }
 
     /**
      * Set breakpoints from trace entries.
-     * @param entries the trace entries to analyze
-     * @param mode "start" = first line of each procedure, "end" = last line
-     * @return number of breakpoints created
      */
     public int setFromTrace(List<StepEntry> entries, String mode) {
         if (entries == null || entries.isEmpty()) return 0;
+        if (!jdtDebugAvailable) {
+            System.err.println("[tracer] JDT Debug not available, cannot set breakpoints");
+            return 0;
+        }
 
-        // Group by (module, procedure) → find first/last line
-        Map<String, int[]> procLines = new LinkedHashMap<>(); // key: "module|procedure" → [minLine, maxLine]
-
+        // Group by (module, procedure) -> find first/last line
+        Map<String, int[]> procLines = new LinkedHashMap<>();
         for (StepEntry entry : entries) {
             String key = entry.module() + "|" + entry.procedure();
             int[] range = procLines.computeIfAbsent(key, k -> new int[]{entry.line(), entry.line()});
@@ -40,27 +79,50 @@ public class TracerBreakpoints {
             range[1] = Math.max(range[1], entry.line());
         }
 
-        int count = 0;
-        for (Map.Entry<String, int[]> e : procLines.entrySet()) {
-            String[] parts = e.getKey().split("\\|", 2);
-            String modulePath = parts[0];
-            String procedure = parts.length > 1 ? parts[1] : "";
-            int[] range = e.getValue();
-            int line = "end".equals(mode) ? range[1] : range[0];
+        final int[] count = {0};
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
 
-            try {
-                IBreakpoint bp = createLineBreakpoint(modulePath, line, procedure);
-                if (bp != null) {
-                    managedBreakpoints.add(bp);
-                    count++;
+        org.eclipse.core.runtime.jobs.Job.create("Tracer: Set Breakpoints", monitor -> {
+            for (Map.Entry<String, int[]> e : procLines.entrySet()) {
+                String[] parts = e.getKey().split("\\|", 2);
+                String modulePath = parts[0];
+                String procedure = parts.length > 1 ? parts[1] : "";
+                int line = "end".equals(mode) ? e.getValue()[1] : e.getValue()[0];
+
+                try {
+                    IResource resource = resolveResource(modulePath);
+                    if (resource == null) {
+                        System.err.println("[tracer] Cannot resolve: " + modulePath);
+                        continue;
+                    }
+                    String typeName = extractTypeName(modulePath);
+
+                    // Create breakpoint via reflection
+                    IBreakpoint bp = (IBreakpoint) createLineBreakpointMethod.invoke(
+                        null, resource, typeName, line, -1, -1, 0, true, null);
+
+                    if (bp != null) {
+                        bp.getMarker().setAttribute("message",
+                            "[tracer] " + procedure + " @ " + resource.getName() + ":" + line);
+                        managedBreakpoints.add(bp);
+                        count[0]++;
+                    }
+                } catch (Exception ex) {
+                    System.err.println("[tracer] BP error " + modulePath + ":" + line
+                        + " — " + ex.getClass().getSimpleName() + ": " + ex.getMessage());
                 }
-            } catch (Exception ex) {
-                System.err.println("[tracer] Failed to create breakpoint at "
-                    + modulePath + ":" + line + " — " + ex.getMessage());
             }
+            System.out.println("[tracer] Created " + count[0] + " breakpoints (mode=" + mode + ")");
+            latch.countDown();
+            return org.eclipse.core.runtime.Status.OK_STATUS;
+        }).schedule();
+
+        try {
+            latch.await(10, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
-        System.out.println("[tracer] Created " + count + " breakpoints (mode=" + mode + ")");
-        return count;
+        return count[0];
     }
 
     /**
@@ -69,18 +131,14 @@ public class TracerBreakpoints {
     public void clearAll() {
         int count = managedBreakpoints.size();
         for (IBreakpoint bp : managedBreakpoints) {
-            try {
-                bp.delete();
-            } catch (CoreException e) {
-                System.err.println("[tracer] Failed to delete breakpoint: " + e.getMessage());
-            }
+            try { bp.delete(); } catch (CoreException e) { /* skip */ }
         }
         managedBreakpoints.clear();
         System.out.println("[tracer] Cleared " + count + " breakpoints");
     }
 
     /**
-     * List all managed breakpoints.
+     * List managed breakpoints as JSON.
      */
     public String listAsJson() {
         StringBuilder sb = new StringBuilder("[");
@@ -89,7 +147,7 @@ public class TracerBreakpoints {
             IBreakpoint bp = managedBreakpoints.get(i);
             sb.append("{");
             try {
-                sb.append("\"id\":\"").append(bp.getMarker().getId()).append("\"");
+                sb.append("\"id\":").append(bp.getMarker().getId());
                 sb.append(",\"resource\":\"").append(esc(bp.getMarker().getResource().getName())).append("\"");
                 sb.append(",\"line\":").append(bp.getMarker().getAttribute("line", -1));
                 sb.append(",\"enabled\":").append(bp.isEnabled());
@@ -105,139 +163,52 @@ public class TracerBreakpoints {
     }
 
     public int size() { return managedBreakpoints.size(); }
+    public boolean isAvailable() { return jdtDebugAvailable; }
 
-    /**
-     * Create a line breakpoint at the given module:line.
-     * Module path format: "L/projectName/src/package/Class.java" or "src/package/Class.java"
-     */
-    private IBreakpoint createLineBreakpoint(String modulePath, int line, String procedure) throws CoreException {
-        IResource resource = resolveResource(modulePath);
-        if (resource == null) {
-            System.err.println("[tracer] Cannot resolve resource: " + modulePath);
-            return null;
-        }
+    // --- Resource resolution ---
 
-        // Extract type name from module path for the breakpoint
-        String typeName = extractTypeName(modulePath);
-
-        IJavaLineBreakpoint bp = JDIDebugModel.createLineBreakpoint(
-            resource,           // IResource
-            typeName,           // type name
-            line,               // line number
-            -1,                 // charStart (-1 = not specified)
-            -1,                 // charEnd
-            0,                  // hitCount (0 = always)
-            true,               // register with breakpoint manager
-            null                // attributes (null = defaults)
-        );
-
-        // Set a marker attribute for identification
-        bp.getMarker().setAttribute("message",
-            "[tracer] " + procedure + " @ " + resource.getName() + ":" + line);
-
-        return bp;
-    }
-
-    /**
-     * Resolve module path to IResource.
-     * Handles formats like:
-     *   "L/tracer_test_17/src/com/test/TracerTestApp.java"
-     *   "/tracer_test_17/src/com/test/TracerTestApp.java"
-     *   "src/com/test/TracerTestApp.java"
-     */
     private IResource resolveResource(String modulePath) {
         if (modulePath == null || modulePath.isEmpty()) return null;
-
         String path = modulePath;
-        // Strip leading "L/" if present
         if (path.startsWith("L/")) path = path.substring(2);
-        // Strip leading "/" if present
         if (path.startsWith("/")) path = path.substring(1);
 
         IWorkspaceRoot root = ResourcesPlugin.getWorkspace().getRoot();
 
-        // Try workspace-relative path first
+        // Workspace-relative
         IFile file = root.getFile(new org.eclipse.core.runtime.Path(path));
         if (file != null && file.exists()) return file;
 
-        // Try to extract project name and find file
+        // Extract project name
         int slash = path.indexOf('/');
         if (slash > 0) {
             String projectName = path.substring(0, slash);
             String filePath = path.substring(slash + 1);
             IProject project = root.getProject(projectName);
             if (project != null && project.exists()) {
-                IFile projectFile = project.getFile(filePath);
-                if (projectFile != null && projectFile.exists()) return projectFile;
+                IFile pf = project.getFile(filePath);
+                if (pf != null && pf.exists()) return pf;
+                // Try src/ prefix
+                pf = project.getFile("src/" + filePath);
+                if (pf != null && pf.exists()) return pf;
             }
-        }
-
-        // Search all projects
-        try {
-            for (IProject project : root.getProjects()) {
-                if (!project.isOpen()) continue;
-                IFile found = findFileInProject(project, path);
-                if (found != null) return found;
-            }
-        } catch (Exception e) { /* skip */ }
-
-        return null;
-    }
-
-    private IFile findFileInProject(IProject project, String fileName) {
-        // Simple: try to find file by name in common source directories
-        String[] srcDirs = {"src", "source", "java"};
-        for (String dir : srcDirs) {
-            IFile file = project.getFile(dir + "/" + fileName);
-            if (file != null && file.exists()) return file;
-        }
-        // Try extracting just the filename
-        int lastSlash = fileName.lastIndexOf('/');
-        if (lastSlash >= 0) {
-            String simpleName = fileName.substring(lastSlash + 1);
-            return findFileRecursive(project, simpleName);
         }
         return null;
     }
 
-    private IFile findFileRecursive(IResource container, String fileName) {
-        try {
-            if (container.getType() == IResource.FILE) {
-                if (container.getName().equals(fileName)) return (IFile) container;
-                return null;
-            }
-            if (container instanceof org.eclipse.core.resources.IContainer) {
-                for (IResource member : ((org.eclipse.core.resources.IContainer) container).members()) {
-                    IFile found = findFileRecursive(member, fileName);
-                    if (found != null) return found;
-                }
-            }
-        } catch (CoreException e) { /* skip */ }
-        return null;
-    }
-
-    /**
-     * Extract fully qualified type name from module path.
-     * "L/project/src/com/test/MyClass.java" → "com.test.MyClass"
-     */
     private String extractTypeName(String modulePath) {
         String path = modulePath;
         if (path.startsWith("L/")) path = path.substring(2);
         if (path.startsWith("/")) path = path.substring(1);
-
-        // Find src/ boundary
         int srcIdx = path.indexOf("/src/");
         String relative;
         if (srcIdx >= 0) {
-            relative = path.substring(srcIdx + 5); // after "/src/"
+            relative = path.substring(srcIdx + 5);
         } else {
-            // Try to find the .java file directly
             relative = path;
             int slash = relative.indexOf('/');
             if (slash >= 0) relative = relative.substring(slash + 1);
         }
-
-        // Convert path to type name: "com/test/MyClass.java" → "com.test.MyClass"
         if (relative.endsWith(".java")) relative = relative.substring(0, relative.length() - 5);
         return relative.replace('/', '.').replace('\\', '.');
     }
