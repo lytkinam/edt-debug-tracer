@@ -149,7 +149,7 @@ public class TracerBreakpoints {
             try {
                 sb.append("\"id\":").append(bp.getMarker().getId());
                 sb.append(",\"resource\":\"").append(esc(bp.getMarker().getResource().getName())).append("\"");
-                sb.append(",\"line\":").append(bp.getMarker().getAttribute("line", -1));
+                sb.append(",\"line\":").append(bp.getMarker().getAttribute("lineNumber", -1));
                 sb.append(",\"enabled\":").append(bp.isEnabled());
                 String msg = bp.getMarker().getAttribute("message", "");
                 sb.append(",\"message\":\"").append(esc(msg)).append("\"");
