@@ -342,4 +342,76 @@ public class TracerStorage {
             return rs.next() ? rs.getInt(1) : 0;
         } catch (Exception e) { return -1; }
     }
+
+    /**
+     * Get last session info as JSON.
+     */
+    public String getLastSessionJson() {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                "SELECT session_id, project_name, total_steps, auto_steps, status, started_at, stopped_at " +
+                "FROM sessions ORDER BY started_at DESC LIMIT 1")) {
+            if (rs.next()) {
+                return "{\"session_id\":\"" + rs.getString("session_id")
+                    + "\",\"project_name\":\"" + esc(rs.getString("project_name"))
+                    + "\",\"total_steps\":" + rs.getInt("total_steps")
+                    + ",\"auto_steps\":" + rs.getInt("auto_steps")
+                    + ",\"status\":\"" + rs.getString("status")
+                    + "\",\"started_at\":" + rs.getLong("started_at")
+                    + ",\"stopped_at\":" + rs.getLong("stopped_at") + "}";
+            }
+            return "{\"error\":\"no sessions\"}";
+        } catch (Exception e) {
+            return "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
+        }
+    }
+
+    /**
+     * Get steps from a session as StepEntry list (for breakpoint creation).
+     */
+    public java.util.List<StepEntry> getSessionSteps(String sessionId) {
+        java.util.List<StepEntry> result = new java.util.ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT procedure_name, line_number, module_path, thread_name, thread_id, ts, " +
+                "char_start, char_end, stack_depth, parent_seq, stack_json, variables_json " +
+                "FROM steps WHERE session_id = ? ORDER BY seq")) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.add(new StepEntry(
+                        rs.getString("procedure_name"),
+                        rs.getInt("line_number"),
+                        rs.getString("module_path"),
+                        rs.getString("thread_name"),
+                        rs.getInt("thread_id"),
+                        rs.getLong("ts"),
+                        rs.getInt("char_start"),
+                        rs.getInt("char_end"),
+                        rs.getInt("stack_depth"),
+                        rs.getInt("parent_seq"),
+                        rs.getString("stack_json"),
+                        rs.getString("variables_json")
+                    ));
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[tracer] getSessionSteps error: " + e.getMessage());
+        }
+        return result;
+    }
+
+    /**
+     * Get the last session ID.
+     */
+    public String getLastSessionId() {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                "SELECT session_id FROM sessions ORDER BY started_at DESC LIMIT 1")) {
+            return rs.next() ? rs.getString("session_id") : null;
+        } catch (Exception e) { return null; }
+    }
+
+    private static String esc(String s) {
+        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
 }

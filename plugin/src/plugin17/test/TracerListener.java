@@ -715,4 +715,166 @@ public class TracerListener implements IDebugEventSetListener {
     private String getFrameProcedure(IStackFrame frame) {
         try { return frame.getName(); } catch (Exception e) { return ""; }
     }
+
+    // --- Debug Session Control API ---
+
+    /**
+     * Launch a Java application in debug mode.
+     */
+    public String launchDebug(String projectName, String mainClass) {
+        try {
+            org.eclipse.debug.core.ILaunchManager lm =
+                DebugPlugin.getDefault().getLaunchManager();
+            org.eclipse.debug.core.ILaunchConfigurationType type =
+                lm.getLaunchConfigurationType("org.eclipse.jdt.launching.localJavaApplication");
+
+            // Find existing config or create temporary
+            org.eclipse.debug.core.ILaunchConfiguration config = null;
+            for (org.eclipse.debug.core.ILaunchConfiguration c : lm.getLaunchConfigurations(type)) {
+                String proj = c.getAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", "");
+                String cls = c.getAttribute("org.eclipse.jdt.launching.MAIN_TYPE", "");
+                if (proj.equals(projectName) && cls.equals(mainClass)) {
+                    config = c;
+                    break;
+                }
+            }
+
+            if (config == null) {
+                // Create temporary launch configuration
+                org.eclipse.debug.core.ILaunchConfigurationWorkingCopy wc =
+                    type.newInstance(null, "Tracer-" + mainClass);
+                wc.setAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", projectName);
+                wc.setAttribute("org.eclipse.jdt.launching.MAIN_TYPE", mainClass);
+                config = wc;
+            }
+
+            config.launch(org.eclipse.debug.core.ILaunchManager.DEBUG_MODE, null);
+            return "{\"launched\":true,\"name\":\"" + esc(config.getName()) + "\"}";
+        } catch (Exception e) {
+            return "{\"launched\":false,\"error\":\"" + esc(e.getMessage()) + "\"}";
+        }
+    }
+
+    /**
+     * Get current debug session status.
+     */
+    public String getDebugStatus() {
+        try {
+            org.eclipse.debug.core.ILaunch[] launches =
+                DebugPlugin.getDefault().getLaunchManager().getLaunches();
+            for (org.eclipse.debug.core.ILaunch launch : launches) {
+                if (launch.isTerminated()) continue;
+                for (IDebugTarget target : launch.getDebugTargets()) {
+                    if (target.isTerminated()) continue;
+                    for (IThread thread : target.getThreads()) {
+                        if (thread.isSuspended()) {
+                            IStackFrame frame = thread.getTopStackFrame();
+                            String loc = "";
+                            if (frame != null) {
+                                loc = frame.getName() + ":" + frame.getLineNumber();
+                            }
+                            return "{\"state\":\"suspended\",\"location\":\"" + esc(loc)
+                                + "\",\"thread\":\"" + esc(thread.getName())
+                                + "\",\"launch\":\"" + esc(launch.getLaunchConfiguration().getName()) + "\"}";
+                        }
+                    }
+                    return "{\"state\":\"running\",\"launch\":\""
+                        + esc(launch.getLaunchConfiguration().getName()) + "\"}";
+                }
+            }
+            // Check for terminated launches
+            for (org.eclipse.debug.core.ILaunch launch : launches) {
+                if (launch.isTerminated()) {
+                    return "{\"state\":\"terminated\",\"launch\":\""
+                        + esc(launch.getLaunchConfiguration().getName()) + "\"}";
+                }
+            }
+            return "{\"state\":\"none\"}";
+        } catch (Exception e) {
+            return "{\"state\":\"error\",\"message\":\"" + esc(e.getMessage()) + "\"}";
+        }
+    }
+
+    /**
+     * Perform a debug step.
+     */
+    public String debugStep(String type) {
+        try {
+            IThread thread = findSuspendedThread();
+            if (thread == null) return "{\"ok\":false,\"error\":\"no suspended thread\"}";
+            switch (type != null ? type : "over") {
+                case "into": thread.stepInto(); break;
+                case "return": thread.stepReturn(); break;
+                default: thread.stepOver(); break;
+            }
+            // Wait briefly for step to complete, then get location
+            Thread.sleep(200);
+            IThread after = findSuspendedThread();
+            if (after != null) {
+                IStackFrame frame = after.getTopStackFrame();
+                if (frame != null) {
+                    return "{\"ok\":true,\"location\":\"" + esc(frame.getName())
+                        + ":" + frame.getLineNumber() + "\"}";
+                }
+            }
+            return "{\"ok\":true,\"location\":\"unknown\"}";
+        } catch (Exception e) {
+            return "{\"ok\":false,\"error\":\"" + esc(e.getMessage()) + "\"}";
+        }
+    }
+
+    /**
+     * Resume execution.
+     */
+    public String debugResume() {
+        try {
+            IThread thread = findSuspendedThread();
+            if (thread == null) return "{\"ok\":false,\"error\":\"no suspended thread\"}";
+            thread.resume();
+            return "{\"ok\":true}";
+        } catch (Exception e) {
+            return "{\"ok\":false,\"error\":\"" + esc(e.getMessage()) + "\"}";
+        }
+    }
+
+    /**
+     * Terminate debug session.
+     */
+    public String debugTerminate() {
+        try {
+            org.eclipse.debug.core.ILaunch[] launches =
+                DebugPlugin.getDefault().getLaunchManager().getLaunches();
+            for (org.eclipse.debug.core.ILaunch launch : launches) {
+                if (!launch.isTerminated()) {
+                    launch.terminate();
+                    return "{\"terminated\":true,\"launch\":\""
+                        + esc(launch.getLaunchConfiguration().getName()) + "\"}";
+                }
+            }
+            return "{\"terminated\":false,\"error\":\"no active launch\"}";
+        } catch (Exception e) {
+            return "{\"terminated\":false,\"error\":\"" + esc(e.getMessage()) + "\"}";
+        }
+    }
+
+    /**
+     * Get stack trace of suspended thread.
+     */
+    public String getStackTraceJson() {
+        try {
+            IThread thread = findSuspendedThread();
+            if (thread == null) return "{\"error\":\"no suspended thread\",\"frames\":[]}";
+            IStackFrame[] frames = thread.getStackFrames();
+            StringBuilder sb = new StringBuilder("{\"thread\":\"" + esc(thread.getName()) + "\",\"frames\":[");
+            for (int i = 0; i < frames.length; i++) {
+                if (i > 0) sb.append(",");
+                sb.append("{\"procedure\":\"").append(esc(frames[i].getName()))
+                  .append("\",\"line\":").append(frames[i].getLineNumber()).append("}");
+            }
+            sb.append("]}");
+            return sb.toString();
+        } catch (Exception e) {
+            return "{\"error\":\"" + esc(e.getMessage()) + "\",\"frames\":[]}";
+        }
+    }
 }

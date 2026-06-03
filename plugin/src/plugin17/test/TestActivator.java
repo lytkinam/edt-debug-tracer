@@ -153,13 +153,26 @@ public class TestActivator implements BundleActivator {
             try {
                 String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
                 String mode = "start";
+                String session = "";
                 int idx = body.indexOf("\"mode\"");
                 if (idx >= 0) {
                     int q1 = body.indexOf('"', idx + 6);
                     int q2 = body.indexOf('"', q1 + 1);
                     if (q1 >= 0 && q2 > q1) mode = body.substring(q1 + 1, q2);
                 }
-                java.util.List<StepEntry> entries = tracer.getEntries();
+                idx = body.indexOf("\"session\"");
+                if (idx >= 0) {
+                    int q1 = body.indexOf('"', idx + 9);
+                    int q2 = body.indexOf('"', q1 + 1);
+                    if (q1 >= 0 && q2 > q1) session = body.substring(q1 + 1, q2);
+                }
+                java.util.List<StepEntry> entries;
+                if ("last".equals(session) && storage != null) {
+                    String sid = storage.getLastSessionId();
+                    entries = sid != null ? storage.getSessionSteps(sid) : tracer.getEntries();
+                } else {
+                    entries = tracer.getEntries();
+                }
                 int count = breakpoints.setFromTrace(entries, mode);
                 respond(ex, 200, "{\"set\":" + count + ",\"mode\":\"" + mode + "\"}");
             } catch (Exception e) {
@@ -176,6 +189,59 @@ public class TestActivator implements BundleActivator {
         server.createContext("/mcp/breakpoints/list", ex -> {
             if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
             respond(ex, 200, breakpoints.listAsJson());
+        });
+
+        // Debug session control endpoints
+        server.createContext("/mcp/debug/launch", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            try {
+                String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                String project = extractJsonString(body, "project");
+                String mainClass = extractJsonString(body, "mainClass");
+                respond(ex, 200, tracer.launchDebug(project, mainClass));
+            } catch (Exception e) {
+                respond(ex, 500, "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}");
+            }
+        });
+
+        server.createContext("/mcp/debug/status", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            respond(ex, 200, tracer.getDebugStatus());
+        });
+
+        server.createContext("/mcp/debug/step", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            try {
+                String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                String type = extractJsonString(body, "type");
+                respond(ex, 200, tracer.debugStep(type));
+            } catch (Exception e) {
+                respond(ex, 500, "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}");
+            }
+        });
+
+        server.createContext("/mcp/debug/resume", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            respond(ex, 200, tracer.debugResume());
+        });
+
+        server.createContext("/mcp/debug/terminate", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            respond(ex, 200, tracer.debugTerminate());
+        });
+
+        server.createContext("/mcp/debug/stack", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            respond(ex, 200, tracer.getStackTraceJson());
+        });
+
+        server.createContext("/mcp/sessions/last", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            if (storage != null) {
+                respond(ex, 200, storage.getLastSessionJson());
+            } else {
+                respond(ex, 200, "{\"error\":\"storage not available\"}");
+            }
         });
 
         server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(serverThreads));
@@ -210,6 +276,18 @@ public class TestActivator implements BundleActivator {
         ex.sendResponseHeaders(code, bytes.length);
         ex.getResponseBody().write(bytes);
         ex.getResponseBody().close();
+    }
+
+    private static String extractJsonString(String json, String key) {
+        int idx = json.indexOf("\"" + key + "\"");
+        if (idx < 0) return "";
+        int colon = json.indexOf(':', idx + key.length() + 2);
+        if (colon < 0) return "";
+        int q1 = json.indexOf('"', colon + 1);
+        if (q1 < 0) return "";
+        int q2 = json.indexOf('"', q1 + 1);
+        if (q2 < 0) return "";
+        return json.substring(q1 + 1, q2);
     }
 
     private static String esc(String s) {
