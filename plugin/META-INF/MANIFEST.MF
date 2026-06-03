@@ -7,6 +7,9 @@ Bundle-Activator: plugin17.test.TestActivator
 Automatic-Module-Name: plugin17.test
 Bundle-RequiredExecutionEnvironment: JavaSE-17
 Require-Bundle: org.eclipse.core.runtime,
- org.eclipse.debug.core
+ org.eclipse.debug.core,
+ org.eclipse.core.resources,
+ org.eclipse.jdt.core,
+ org.eclipse.jdt.debug
 Import-Package: org.junit;version="4.13.0";resolution:=optional,
  org.junit.runner;version="4.13.0";resolution:=optional

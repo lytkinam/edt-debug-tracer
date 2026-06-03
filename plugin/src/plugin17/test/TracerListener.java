@@ -266,9 +266,13 @@ public class TracerListener implements IDebugEventSetListener {
     }
 
     public void startAutoStep(int maxSteps) {
-        // P4.1: use default if 0, cap at maxSteps
+        // P4.1: use default if 0, cap at maxSteps (0 = unlimited)
         if (maxSteps <= 0) maxSteps = autoStepDefaultSteps;
-        maxSteps = Math.min(maxSteps, autoStepMaxSteps);
+        if (autoStepMaxSteps > 0) {
+            maxSteps = Math.min(maxSteps, autoStepMaxSteps);
+        }
+        // 0 = unlimited: use Integer.MAX_VALUE as sentinel
+        if (maxSteps <= 0) maxSteps = Integer.MAX_VALUE;
         stepsRemaining.set(maxSteps);
         autoStepping.set(true);
         new Thread(() -> {
@@ -284,7 +288,7 @@ public class TracerListener implements IDebugEventSetListener {
     }
 
     private void doAutoStep(IThread thread) {
-        if (autoStepping.get() && stepsRemaining.getAndDecrement() > 0) {
+        if (autoStepping.get() && recording.get() && stepsRemaining.getAndDecrement() > 0) {
             try {
                 // P4.1: delay between steps
                 if (autoStepDelayMs > 0) {
@@ -391,6 +395,7 @@ public class TracerListener implements IDebugEventSetListener {
     public boolean isAutoStepping() { return autoStepping.get(); }
     public int size() { return entries.size(); }
     public int getTotalSteps() { return totalSteps; }
+    public List<StepEntry> getEntries() { return List.copyOf(entries); }
 
     // --- Variables capture helper (1.2) ---
     private String captureVariables(IStackFrame frame) {

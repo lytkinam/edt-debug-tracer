@@ -15,6 +15,7 @@ public class TestActivator implements BundleActivator {
     private HttpServer server;
     private TracerListener tracer;
     private TracerStorage storage;
+    private TracerBreakpoints breakpoints;
     private int port = 18080;
     private String outputPath;
 
@@ -75,6 +76,7 @@ public class TestActivator implements BundleActivator {
         }
 
         DebugPlugin.getDefault().addDebugEventListener(tracer);
+        breakpoints = new TracerBreakpoints();
 
         // P9: read server config
         serverHost = props.getProperty("server.host", "localhost");
@@ -145,6 +147,33 @@ public class TestActivator implements BundleActivator {
             respond(ex, 200, sb.toString());
         });
 
+        // Breakpoint management endpoints
+        server.createContext("/mcp/breakpoints/set", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            String mode = "start";
+            int idx = body.indexOf("\"mode\"");
+            if (idx >= 0) {
+                int q1 = body.indexOf('"', idx + 6);
+                int q2 = body.indexOf('"', q1 + 1);
+                if (q1 >= 0 && q2 > q1) mode = body.substring(q1 + 1, q2);
+            }
+            java.util.List<StepEntry> entries = tracer.getEntries();
+            int count = breakpoints.setFromTrace(entries, mode);
+            respond(ex, 200, "{\"set\":" + count + ",\"mode\":\"" + mode + "\"}");
+        });
+
+        server.createContext("/mcp/breakpoints/clear", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            breakpoints.clearAll();
+            respond(ex, 200, "{\"cleared\":true}");
+        });
+
+        server.createContext("/mcp/breakpoints/list", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            respond(ex, 200, breakpoints.listAsJson());
+        });
+
         server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(serverThreads));
         server.start();
         System.out.println("[tracer] Active on " + serverHost + ":" + port
@@ -166,6 +195,7 @@ public class TestActivator implements BundleActivator {
     public void stop(BundleContext ctx) throws Exception {
         if (server != null) server.stop(0);
         if (tracer != null) DebugPlugin.getDefault().removeDebugEventListener(tracer);
+        if (breakpoints != null) breakpoints.clearAll();
         if (storage != null) storage.close();
     }
 
