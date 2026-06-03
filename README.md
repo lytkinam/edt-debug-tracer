@@ -1,204 +1,210 @@
 # EDT Debug Tracer
 
-Eclipse OSGi-плагин для трассировки отладки 1С:EDT. Перехватывает SUSPEND-события Eclipse Debug API, записывает позицию (процедура, строка, поток) и автоматически выполняет stepOver для пошагового прохождения кода.
+Eclipse OSGi-плагин для трассировки отладки 1С:EDT и Java-приложений. Перехватывает SUSPEND-события Eclipse Debug API, записывает позицию (процедура, строка, модуль, стек, переменные) и автоматически выполняет step-over/into для пошагового прохождения кода. Управляет debug-сессиями и breakpoints через собственный REST API.
 
 ## Возможности
 
-- **Перехват debug-событий** через `IDebugEventSetListener` — нулевой overhead, 0% потерь
-- **Pipeline auto-step** — stepOver вызывается напрямую из event handler, запись делегирована фоновому потоку через `BlockingQueue`
-- **Запись в файл** — JSON-массив `StepEntry[]` с процедурой, строкой, thread_id, timestamp
-- **REST API** — `/mcp/health`, `/mcp/start`, `/mcp/run`, `/mcp/stop`
-- **Per-workspace конфигурация** — каждый Eclipse instance читает свой `{workspace}/.edt-debug-tracer/tracer.properties`
+- **Перехват debug-событий** через `IDebugEventSetListener` — pipeline auto-step без Thread creation
+- **12 полей на каждый шаг**: procedure, line, module, thread_name, thread_id, ts, char_start, char_end, stack_depth, parent_seq, stack[], variables{}
+- **SQLite + JSON** dual storage — запись в БД и файл одновременно
+- **17 HTTP endpoints** — управление записью, debug-сессией, breakpoints, сессиями
+- **Breakpoint management** — автоматическая расстановка точек останова по данным трейса (начало/конец каждой процедуры)
+- **Debug session control** — launch, step, resume, terminate, stack trace через API
+- **Фильтрация** — дедупликация, include/exclude модулей и процедур, лимиты записи
+- **~130 конфигурируемых параметров** в `tracer.properties`
+- **Post-processing** — call tree, dependency graph, hot spots, loop collapse (`scripts/analyze_trace.py`)
 
 ## Быстрый старт
 
 ### Установка
 
 ```bash
-# 1. Собрать jar
 git clone https://github.com/lytkinam/edt-debug-tracer
 cd edt-debug-tracer
-javac --release 17 -d plugin/bin -cp "$EDT_PLUGINS/org.eclipse.osgi_*.jar:$EDT_PLUGINS/org.eclipse.core.runtime_*.jar:$EDT_PLUGINS/org.eclipse.equinox.common_*.jar:$EDT_PLUGINS/org.eclipse.debug.core_*.jar" plugin/src/plugin17/test/*.java
 
-# 2. Упаковать jar
-jar cfm plugin/plugin17-test_1.0.0.jar plugin/META-INF/MANIFEST.MF -C plugin/bin .
+# Собрать (Eclipse 2026-03)
+EP="/opt/eclipse-latest/plugins"
+CP="$EP/org.eclipse.osgi_*.jar:$EP/org.eclipse.core.runtime_*.jar:$EP/org.eclipse.equinox.common_*.jar:$EP/org.eclipse.debug.core_*.jar:$EP/org.eclipse.core.resources_*.jar:$EP/org.eclipse.core.jobs_*.jar"
+javac --release 17 -d plugin/bin -cp "$CP" plugin/src/plugin17/test/*.java
+jar cfm plugin17-test_1.0.0.jar plugin/META-INF/MANIFEST.MF -C plugin/bin .
 
-# 3. Установить в EDT
-cp plugin/plugin17-test_1.0.0.jar $EDT_DIR/plugins/
+# Установить
+cp plugin17-test_1.0.0.jar /opt/eclipse-latest/plugins/
+echo "plugin17-test,1.0.0.qualifier,plugins/plugin17-test_1.0.0.jar,4,true" \
+  >> /opt/eclipse-latest/configuration/org.eclipse.equinox.simpleconfigurator/bundles.info
 
-# 4. Добавить в bundles.info
-echo "plugin17-test,1.0.0.qualifier,plugins/plugin17-test_1.0.0.jar,4,true" >> $EDT_DIR/configuration/org.eclipse.equinox.simpleconfigurator/bundles.info
-
-# 5. Перезапустить EDT (БЕЗ -clean)
+# Перезапустить (БЕЗ -clean)
+./scripts/eclipse-launch.sh restart
 ```
 
 ### Конфигурация
 
-Создать файл `{workspace}/.edt-debug-tracer/tracer.properties`:
+Файл `{workspace}/.edt-debug-tracer/tracer.properties`. Пример:
 
 ```properties
-port=18080
-output=~/.edt-debug-tracer/trace.json
+port=18060
+storage.mode=both
+storage.sqlite.path={workspace}/.edt-debug-tracer/tracer.db
+capture.module.enabled=true
+capture.variables.enabled=true
+capture.callStack.enabled=true
+autoStep.stepType=into
+autoStep.defaultSteps=0
 ```
 
-| Параметр | Описание | По умолчанию |
-|----------|----------|-------------|
-| `port` | HTTP-порт плагина | 18080 |
-| `output` | Путь к файлу трейса | `{workspace}/.edt-debug-tracer/trace.json` |
-
-Для разных Eclipse instance — разные workspace → разные конфиги:
+Полный файл конфигурации с комментариями на русском — ~130 параметров в 12 секциях: Server, Auth, Storage, SQLite, Capture (module/variables/thread/charPos/callStack), Dedup, Filters, Limits, Auto-step, Writer, Reliability, Logging.
 
 | Instance | Workspace | Порт |
 |----------|-----------|------|
 | Eclipse 2026-03 (dev) | `/home/ai/workspace-eclipse-latest/` | 18060 |
-| EDT (production) | `/home/ai/workspace-edt2025/` | 18080 |
-
-### Использование
-
-```bash
-# 1. Поставить breakpoint в EDT (вручную или через codepilot1c MCP)
-
-# 2. Запустить запись
-curl -X POST http://localhost:18080/mcp/start
-
-# 3. Запустить debug-сессию в EDT (F11 или через codepilot1c)
-#    Трейсер начнёт запись при первом SUSPEND
-
-# 4. Запустить auto-step (опционально — для автоматического прохождения)
-curl -X POST http://localhost:18080/mcp/run -d '{"steps":100}'
-
-# 5. Остановить запись и сохранить в файл
-curl -X POST http://localhost:18080/mcp/stop
-```
+| EDT 2025.1.5 (prod) | `/home/ai/workspace-edt2025/` | 18080 |
 
 ## API Reference
 
-### `GET /mcp/health`
+### Запись трейса
 
-Проверка работоспособности.
+| Endpoint | Method | Параметры | Описание |
+|----------|--------|-----------|----------|
+| `/mcp/health` | GET | — | Проверка работоспособности |
+| `/mcp/start` | POST | — | Начать запись трейса |
+| `/mcp/run` | POST | `{"steps":100}` | Запустить auto-step (0 = безлимит) |
+| `/mcp/stop` | POST | — | Остановить запись, сохранить в файл и SQLite |
+| `/mcp/status` | GET | — | Статус: recording, autoStepping, entries, sqlite |
 
-```json
-{"ok":true, "recording":false, "autoStepping":false, "entries":0, "port":18080}
-```
+### Debug-сессия
 
-### `POST /mcp/start`
+| Endpoint | Method | Параметры | Описание |
+|----------|--------|-----------|----------|
+| `/mcp/debug/launch` | POST | `{"project":"...","mainClass":"..."}` | Запустить debug-сессию |
+| `/mcp/debug/status` | GET | — | Состояние: running/suspended/terminated/none |
+| `/mcp/debug/step` | POST | `{"type":"over"|"into"|"return"}` | Шаг отладки |
+| `/mcp/debug/resume` | POST | — | Продолжить выполнение |
+| `/mcp/debug/terminate` | POST | — | Завершить debug-сессию |
+| `/mcp/debug/stack` | GET | — | Стек текущего suspended потока |
 
-Начать запись трейса. Очищает буфер, запускает writer-thread.
+### Breakpoints
 
-```json
-{"started":true}
-```
+| Endpoint | Method | Параметры | Описание |
+|----------|--------|-----------|----------|
+| `/mcp/breakpoints/set` | POST | `{"mode":"start"|"end","session":"last"}` | Расставить breakpoints из трейса |
+| `/mcp/breakpoints/clear` | POST | — | Снять все managed breakpoints |
+| `/mcp/breakpoints/list` | GET | — | Список managed breakpoints |
 
-### `POST /mcp/run`
+### Сессии (SQLite)
 
-Запустить auto-step. После каждого SUSPEND автоматически вызывает `thread.stepOver()`.
-
-Request: `{"steps": 100}`
-
-```json
-{"autoStep":true, "maxSteps":100}
-```
-
-### `POST /mcp/stop`
-
-Остановить запись. Сохраняет трейс в файл (из конфига `output`).
-
-```json
-{"stopped":true, "count":30, "totalSteps":30, "file":"/path/to/trace.json"}
-```
+| Endpoint | Method | Параметры | Описание |
+|----------|--------|-----------|----------|
+| `/mcp/sessions/list` | GET | — | Все сессии (id, project, steps, status, timestamps) |
+| `/mcp/sessions/last` | GET | — | Последняя сессия |
+| `/mcp/sessions/steps` | GET/POST | `session_id` (query param или body) | Полный лог конкретной сессии |
 
 ## Формат трейса
 
-JSON-массив `StepEntry[]`:
+Каждый шаг содержит 12 полей:
 
 ```json
-[
-  {"procedure":"МодульСеанса.УстановкаПараметровСеанса(ИменаПараметровСеанса = Массив) строка: 16","line":16,"module":"","thread_id":646430608,"ts":1780382800451},
-  {"procedure":"ОбщийМодуль.СтандартныеПодсистемыСервер.Модуль.УстановкаПараметровСеанса(ИменаПараметровСеанса = ) строка: 45","line":45,"module":"","thread_id":646430608,"ts":1780382800738}
-]
+{
+  "procedure": "addOne",
+  "line": 29,
+  "module": "L/tracer_test_17/src/com/test/TracerTestApp.java",
+  "thread_name": "main",
+  "thread_id": 1971996155,
+  "ts": 1780393616645,
+  "char_start": -1,
+  "char_end": -1,
+  "stack_depth": 2,
+  "parent_seq": 10,
+  "stack": [{"procedure":"addOne","line":29},{"procedure":"main","line":11}],
+  "variables": {"x":{"type":"int","value":"4"}}
+}
 ```
 
-| Поле | Тип | Описание |
-|------|-----|----------|
-| `procedure` | string | Полное имя процедуры с параметрами из `IStackFrame.getName()` |
-| `line` | int | Номер строки из `IStackFrame.getLineNumber()` |
-| `module` | string | Модуль (пока пустой, зарезервирован для `ISourceLocator`) |
-| `thread_id` | int | `System.identityHashCode(thread)` |
-| `ts` | long | `System.currentTimeMillis()` |
+| Поле | Описание |
+|------|----------|
+| `procedure` | Имя процедуры из `IStackFrame.getName()` |
+| `line` | Номер строки |
+| `module` | Путь к модулю через `ISourceLocator` |
+| `thread_name` | Имя потока (`thread.getName()`) |
+| `thread_id` | `identityHashCode` потока |
+| `ts` | `System.currentTimeMillis()` |
+| `char_start/end` | Позиция символа из `IStackFrame` |
+| `stack_depth` | Глубина стека вызовов |
+| `parent_seq` | Seq шага-родителя (алгоритм отслеживания depth transitions) |
+| `stack` | Полный стек: `[{procedure, line}, ...]` |
+| `variables` | Локальные переменные: `{name: {type, value}}` |
+
+## Целевой сценарий
+
+```
+1. /mcp/debug/launch         → запуск Java-приложения в debug
+2. /mcp/start                → начать запись
+3. /mcp/run {"steps":0}      → auto-step (безлимитный, stepInto)
+4. /mcp/stop                 → остановить запись
+5. /mcp/debug/terminate      → завершить debug-сессию
+6. /mcp/sessions/last        → получить ID последней сессии
+7. /mcp/breakpoints/set      → расставить breakpoints из трейса
+     {"mode":"start","session":"last"}
+8. /mcp/debug/launch         → повторный запуск
+9. /mcp/debug/status         → {"state":"suspended","location":"main:10"}
+10. /mcp/debug/step          → пошаговая отладка
+11. /mcp/debug/resume        → до следующего breakpoint
+```
 
 ## Архитектура
 
 ```
-┌─ Eclipse Debug Framework ──────────────────────────────┐
-│                                                         │
-│  SUSPEND event ──→ IDebugEventSetListener              │
-│                     (TracerListener.handleDebugEvents) │
-│                       │                                 │
-│                       ├─→ read IStackFrame (fast, ~1μs)│
-│                       ├─→ queue.offer(entry)  (~0.5μs) │
-│                       └─→ thread.stepOver()   (~10μs)  │
-│                                                         │
-│  ┌─ Writer Thread (daemon) ───────────────────────┐    │
-│  │  queue.take() → entries.add() → fileWriter     │    │
-│  └─────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────┘
+┌─ Eclipse Debug Framework ──────────────────────────────────┐
+│                                                             │
+│  SUSPEND event ──→ TracerListener.handleDebugEvents        │
+│                       │                                     │
+│                       ├─→ ISourceLocator (module)           │
+│                       ├─→ getVariables() (variables)        │
+│                       ├─→ getStackFrames() (stack+parentSeq)│
+│                       ├─→ queue.offer(entry)  (async)       │
+│                       └─→ thread.stepOver/Into()  (direct)  │
+│                                                             │
+│  ┌─ Writer Thread ────────────┐  ┌─ SQLite Writer ──────┐  │
+│  │  queue → entries → JSON    │  │  queue → batch → DB   │  │
+│  └────────────────────────────┘  └───────────────────────┘  │
+│                                                             │
+│  ┌─ TracerBreakpoints ────────┐  ┌─ Debug Control ───────┐  │
+│  │  JDIDebugModel (reflective)│  │  launch/step/resume   │  │
+│  └────────────────────────────┘  └───────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
          │
          ▼
-  HttpServer (com.sun.net.httpserver)
-    GET  /mcp/health
-    POST /mcp/start
-    POST /mcp/run     ← auto-step controller
-    POST /mcp/stop    ← flush to file
+  HttpServer (com.sun.net.httpserver, 17 endpoints)
+    /mcp/health, /mcp/start, /mcp/run, /mcp/stop, /mcp/status
+    /mcp/debug/launch, /mcp/debug/status, /mcp/debug/step
+    /mcp/debug/resume, /mcp/debug/terminate, /mcp/debug/stack
+    /mcp/breakpoints/set, /mcp/breakpoints/clear, /mcp/breakpoints/list
+    /mcp/sessions/list, /mcp/sessions/last, /mcp/sessions/steps
 ```
 
-### Pipeline (hot path)
+## Структура проекта
 
 ```
-SUSPEND event
-  → frame.getName() + getLineNumber()    ~1μs
-  → queue.offer(entry)                    ~0.5μs
-  → thread.stepOver()                     ~10μs (direct, no Thread creation)
-  ────────────────────────────────────────
-  Total hot path:                         ~12μs
-```
+plugin/src/plugin17/test/
+├── TestActivator.java          # BundleActivator + HttpServer (17 endpoints)
+├── TracerListener.java         # IDebugEventSetListener + debug control + capture
+├── TracerStorage.java          # SQLite: sessions, steps, analysis, call_edges
+├── TracerBreakpoints.java      # Breakpoint management (reflective JDIDebugModel)
+├── StepEntry.java              # record (12 полей)
+├── StepEntrySerializationTest.java
+├── McpHealthTest.java          # PDE JUnit
+└── TracerIntegrationTest.java  # PDE JUnit
 
-Writer-thread обрабатывает очередь асинхронно, не блокируя debug event dispatch.
+scripts/
+├── eclipse-launch.sh           # Управление Eclipse 2026-03
+├── edt-launch.sh               # Управление EDT 2025.1.5
+├── build.sh                    # Сборка jar
+├── setup_dev_env.sh            # Настройка окружения (sqlite-jdbc)
+└── analyze_trace.py            # Post-processing: call tree, deps, hot spots
 
-## Производительность
-
-### Бенчмарки
-
-| Метод | Steps/sec | ms/step | Потери |
-|-------|-----------|---------|--------|
-| codepilot1c MCP (step + wait + get_variables) | ~6 | ~160 | возможны |
-| edt-debug-tracer (event-driven, Thread per step) | 48 | 20 | 0% |
-| **edt-debug-tracer (pipeline, direct stepOver)** | **192** | **5.2** | **0%** |
-
-### На реальном BSL-коде (EDT)
-
-| Метрика | Java test app | BSL 1С (EDT) |
-|---------|--------------|---------------|
-| Steps/sec | 192 | 7.0 |
-| ms/step | 5.2 | 142 |
-| Потери | 0% | 0% |
-
-BSL debug engine EDT значительно тяжелее Java JDI (~140ms vs ~5ms на step), но потерь нет в обоих случаях.
-
-## Разработка
-
-### Структура проекта
-
-```
-plugin/
-├── META-INF/MANIFEST.MF
-├── src/plugin17/test/
-│   ├── TestActivator.java      # BundleActivator + HttpServer
-│   ├── TracerListener.java     # IDebugEventSetListener + pipeline
-│   ├── StepEntry.java          # record(procedure, line, module, threadId, ts)
-│   ├── McpHealthTest.java      # PDE JUnit test
-│   └── TracerIntegrationTest.java
-├── bin/                        # compiled classes
-└── lib/                        # (reserved for sqlite-jdbc)
+docs/
+├── AI-CONTEXT.md               # Документация для AI-агентов
+├── 01_context.md – 10_lib_checklist.md
+└── ...
 ```
 
 ### Зависимости (compile classpath)
@@ -208,53 +214,37 @@ org.eclipse.osgi_*.jar
 org.eclipse.core.runtime_*.jar
 org.eclipse.equinox.common_*.jar
 org.eclipse.debug.core_*.jar
-org.junit_4*.jar (for tests)
+org.eclipse.core.resources_*.jar
+org.eclipse.core.jobs_*.jar
 ```
+
+Runtime: `org.eclipse.jdt.debug` загружается через `Platform.getBundle()` + reflection (OSGi workaround).
 
 ### Сборка
 
 ```bash
-JAVAC="/opt/java/jdk-21/bin/javac"   # или любой JDK 17+
-EP="/opt/eclipse-latest/plugins"      # или EDT plugins
-
-CP="$EP/org.eclipse.osgi_*.jar:$EP/org.eclipse.core.runtime_*.jar:$EP/org.eclipse.equinox.common_*.jar:$EP/org.eclipse.debug.core_*.jar"
-
+EP="/opt/eclipse-latest/plugins"
+CP="$EP/org.eclipse.osgi_*.jar:$EP/org.eclipse.core.runtime_*.jar:$EP/org.eclipse.equinox.common_*.jar:$EP/org.eclipse.debug.core_*.jar:$EP/org.eclipse.core.resources_*.jar:$EP/org.eclipse.core.jobs_*.jar"
 javac --release 17 -d plugin/bin -cp "$CP" plugin/src/plugin17/test/*.java
-jar cfm plugin/plugin17-test_1.0.0.jar plugin/META-INF/MANIFEST.MF -C plugin/bin .
+jar cfm plugin17-test_1.0.0.jar plugin/META-INF/MANIFEST.MF -C plugin/bin .
 ```
 
-### Тестирование через Eclipse PDE MCP
+## История версий
 
-```bash
-# Через AssistAI MCP (eclipse-pde endpoint)
-curl -X POST http://localhost:8124/mcp/eclipse-pde \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"runJUnitPluginTestClass",
-                 "arguments":{"projectName":"plugin17-test",
-                              "className":"plugin17.test.McpHealthTest"}}}'
-```
-
-### Доработка
-
-**Добавить поле в StepEntry:**
-1. Добавить поле в `StepEntry.java` (record)
-2. Заполнить в `TracerListener.handleDebugEvents()` из `IStackFrame`
-3. Пересобрать jar, переустановить
-
-**Добавить endpoint:**
-1. Добавить `server.createContext()` в `TestActivator.start()`
-2. Пересобрать jar, переустановить
-
-**Заполнить `module`:**
-```java
-ILaunch launch = thread.getLaunch();
-ISourceLocator locator = launch.getSourceLocator();
-if (locator != null) {
-    Object src = locator.getSourceElement(frame);
-    module = src != null ? src.toString() : "";
-}
-```
+| Тег | Описание |
+|-----|----------|
+| v1.0 | Pipeline tracer (базовая версия) |
+| v1.1–v1.5 | Обогащение данных: module, variables, threadName, charPos, callStack+parentSeq |
+| v2.0 | Research B: analyze_trace.py (call tree, dependency graph, hot spots) |
+| v3.0 | SQLite storage (sessions, steps, analysis, call_edges) |
+| v4.0 | Управление: dedup, filters, limits, /mcp/status |
+| v5.0 | Auto-step: params, stopOn conditions |
+| v6.0 | Performance + Reliability + Server config + Auth |
+| v7.0 | Breakpoint Management API |
+| v8.0 | Тестирование: stepInto hierarchy + breakpoints set/clear |
+| v9.0 | Debug Session Management API (launch/step/resume/terminate/stack) |
+| v9.1 | Sessions list + per-session steps API |
+| v9.2 | Auto-detect project_name in sessions |
 
 ## Лицензия
 

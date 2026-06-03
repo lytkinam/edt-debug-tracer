@@ -7,6 +7,7 @@
 ```
 Репозиторий: https://github.com/lytkinam/edt-debug-tracer
 Локальный путь: /home/ai/workspace-edt2025/smallbase_test_db/tests/qa/debug_logger/edt-debug-tracer
+Текущая версия: v9.2 (tag v9.2-project-name)
 Архивная версия: tag v1.0 (commit 14a813a)
 Следующие шаги: NEXT-STEPS.md
 ```
@@ -87,8 +88,10 @@ CP="$EP/org.eclipse.osgi_3.24.100.v20251215-1416.jar"
 CP="$CP:$EP/org.eclipse.core.runtime_3.34.200.v20251220-0953.jar"
 CP="$CP:$EP/org.eclipse.equinox.common_3.20.300.v20251111-0312.jar"
 CP="$CP:$EP/org.eclipse.debug.core_3.23.200.v20251107-0507.jar"
+CP="$CP:$EP/org.eclipse.core.resources_3.23.200.v20251217-0810.jar"
+CP="$CP:$EP/org.eclipse.core.jobs_3.15.700.v20250725-1147.jar"
 
-javac --release 17 -d plugin17-test/bin -cp "$CP" plugin17-test/src/plugin17/test/*.java
+javac --release 17 -d plugin/bin -cp "$CP" plugin/src/plugin17/test/*.java
 ```
 
 **Важно:** `--release 17` даже при компиляции JDK 21 (для совместимости с EDT).
@@ -97,8 +100,8 @@ javac --release 17 -d plugin17-test/bin -cp "$CP" plugin17-test/src/plugin17/tes
 
 ```bash
 jar cfm plugin17-test_1.0.0.jar \
-    plugin17-test/META-INF/MANIFEST.MF \
-    -C plugin17-test/bin .
+    plugin/META-INF/MANIFEST.MF \
+    -C plugin/bin .
 ```
 
 ---
@@ -349,9 +352,39 @@ git pull --rebase origin main && git push origin main
 
 **Проверка:** `curl http://localhost:PORT/mcp/health` — если не отвечает, плагин не загрузился.
 
-### 10. sqlite-jdbc не обязателен
+### 10. JDIDebugModel — NoClassDefFoundError в OSGi
 
-Текущая версия (v1.0) пишет в обычный JSON-файл. SQLite был в предыдущих итерациях (v0.2), но усложнял сборку. Может быть возвращён при необходимости (NEXT-STEPS.md, приоритет 4).
+Прямой импорт `org.eclipse.jdt.debug.core.JDIDebugModel` вызывает `NoClassDefFoundError` в runtime, даже если `Require-Bundle` и `Import-Package` указаны в MANIFEST.MF.
+
+**Решение:** reflective class loading через bundle classloader:
+```java
+Bundle bundle = Platform.getBundle("org.eclipse.jdt.debug");
+bundle.start(Bundle.START_ACTIVATION_POLICY);
+Class<?> modelClass = bundle.loadClass("org.eclipse.jdt.debug.core.JDIDebugModel");
+Method method = modelClass.getMethod("createLineBreakpoint", ...);
+IBreakpoint bp = (IBreakpoint) method.invoke(null, resource, typeName, line, -1, -1, 0, true, null);
+```
+
+### 11. Java Properties не поддерживает inline-комментарии
+
+`key=value # comment` — `#` считается частью значения. Комментарии должны быть **на отдельных строках**:
+```properties
+# Правильно:
+port=18060
+# Неправильно:
+port=18060    # порт плагина
+```
+
+### 12. toggleBreakpoint — это переключатель
+
+MCP tool `toggleBreakpoint` **удаляет** breakpoint если он уже существует на этой строке. Для гарантированной установки: сначала `removeAllBreakpoints`, потом `toggleBreakpoint`.
+
+### 13. Активная диагностика через MCP
+
+При возникновении ошибок — **не угадывать**, а проверять через MCP:
+- `eclipse-ide` → `getCompilationErrors` — ошибки компиляции
+- `eclipse-runner` → `listBreakpoints`, `listActiveLaunches` — состояние debug
+- `curl /mcp/debug/status` — статус через наш API
 
 ---
 
