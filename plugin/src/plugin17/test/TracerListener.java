@@ -746,27 +746,41 @@ public class TracerListener implements IDebugEventSetListener {
         try {
             org.eclipse.debug.core.ILaunchManager lm =
                 DebugPlugin.getDefault().getLaunchManager();
-            org.eclipse.debug.core.ILaunchConfigurationType type =
-                lm.getLaunchConfigurationType("org.eclipse.jdt.launching.localJavaApplication");
 
-            // Find existing config or create temporary
+            // Try 1: find by config name (projectName used as config name for 1C launches)
             org.eclipse.debug.core.ILaunchConfiguration config = null;
-            for (org.eclipse.debug.core.ILaunchConfiguration c : lm.getLaunchConfigurations(type)) {
-                String proj = c.getAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", "");
-                String cls = c.getAttribute("org.eclipse.jdt.launching.MAIN_TYPE", "");
-                if (proj.equals(projectName) && cls.equals(mainClass)) {
+            for (org.eclipse.debug.core.ILaunchConfiguration c : lm.getLaunchConfigurations()) {
+                if (c.getName().equals(projectName)) {
                     config = c;
                     break;
                 }
             }
 
+            // Try 2: Java application launch (for Eclipse dev/test)
+            if (config == null && mainClass != null && !mainClass.isEmpty()) {
+                org.eclipse.debug.core.ILaunchConfigurationType type =
+                    lm.getLaunchConfigurationType("org.eclipse.jdt.launching.localJavaApplication");
+                if (type != null) {
+                    for (org.eclipse.debug.core.ILaunchConfiguration c : lm.getLaunchConfigurations(type)) {
+                        String proj = c.getAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", "");
+                        String cls = c.getAttribute("org.eclipse.jdt.launching.MAIN_TYPE", "");
+                        if (proj.equals(projectName) && cls.equals(mainClass)) {
+                            config = c;
+                            break;
+                        }
+                    }
+                    if (config == null) {
+                        org.eclipse.debug.core.ILaunchConfigurationWorkingCopy wc =
+                            type.newInstance(null, "Tracer-" + mainClass);
+                        wc.setAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", projectName);
+                        wc.setAttribute("org.eclipse.jdt.launching.MAIN_TYPE", mainClass);
+                        config = wc;
+                    }
+                }
+            }
+
             if (config == null) {
-                // Create temporary launch configuration
-                org.eclipse.debug.core.ILaunchConfigurationWorkingCopy wc =
-                    type.newInstance(null, "Tracer-" + mainClass);
-                wc.setAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", projectName);
-                wc.setAttribute("org.eclipse.jdt.launching.MAIN_TYPE", mainClass);
-                config = wc;
+                return "{\"launched\":false,\"error\":\"no launch config found for: " + esc(projectName) + "\"}";
             }
 
             config.launch(org.eclipse.debug.core.ILaunchManager.DEBUG_MODE, null);

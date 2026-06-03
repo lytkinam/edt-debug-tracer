@@ -722,6 +722,28 @@ logging.includeTimestamp=true
 | `logging.prefix` | string | `[tracer]` | Префикс сообщений |
 | `logging.includeTimestamp` | boolean | `true` | Включить timestamp |
 
+### 8.4 Remote Debug EDT из Eclipse 2026-03 (JDWP)
+
+Настроить полноценную пошаговую отладку Java-кода плагина, работающего внутри EDT, из Host Eclipse 2026-03.
+
+**Подход:** JDWP Remote Java Application — версия Eclipse не важна, отладка идёт на уровне JVM.
+
+**Настройка EDT (target):**
+```bash
+# В скрипте edt-launch.sh добавить в -vmargs:
+-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005
+```
+
+**Настройка Eclipse 2026-03 (host):**
+1. `Debug Configurations → Remote Java Application`
+2. Project: `plugin17-test` (исходники плагина в git repo)
+3. Host: `localhost`, Port: `5005`
+4. Breakpoints ставятся в Host, выполняются внутри EDT
+
+**Альтернатива (PDE Eclipse Application):** настроить Target Platform на EDT installation — сложнее из-за несовпадения версий бандлов и специфичных com._1c.* бандлов. Не рекомендуется.
+
+**Зачем:** настоящая пошаговая отладка Java-кода плагина внутри EDT — threading issues, NoClassDefFoundError, reflection fallbacks.
+
 ---
 
 ## Приоритет 9: Серверная конфигурация
