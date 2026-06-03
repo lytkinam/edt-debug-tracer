@@ -244,6 +244,52 @@ public class TestActivator implements BundleActivator {
             }
         });
 
+        server.createContext("/mcp/sessions/list", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            if (storage != null) {
+                respond(ex, 200, storage.listSessionsJson());
+            } else {
+                respond(ex, 200, "[]");
+            }
+        });
+
+        server.createContext("/mcp/sessions/steps", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            if (storage == null) {
+                respond(ex, 200, "{\"error\":\"storage not available\"}");
+                return;
+            }
+            try {
+                // Parse session_id from query string or body
+                String query = ex.getRequestURI().getQuery();
+                String sessionId = null;
+                if (query != null) {
+                    for (String param : query.split("&")) {
+                        String[] kv = param.split("=", 2);
+                        if (kv.length == 2 && kv[0].equals("session_id")) {
+                            sessionId = java.net.URLDecoder.decode(kv[1], "UTF-8");
+                        }
+                    }
+                }
+                if (sessionId == null || sessionId.isEmpty()) {
+                    // Try reading from POST body
+                    String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                    sessionId = extractJsonString(body, "session_id");
+                }
+                if (sessionId == null || sessionId.isEmpty()) {
+                    // Default to last session
+                    sessionId = storage.getLastSessionId();
+                }
+                if (sessionId != null) {
+                    respond(ex, 200, storage.getSessionStepsJson(sessionId));
+                } else {
+                    respond(ex, 200, "{\"error\":\"no session specified\"}");
+                }
+            } catch (Exception e) {
+                respond(ex, 500, "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}");
+            }
+        });
+
         server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(serverThreads));
         server.start();
         System.out.println("[tracer] Active on " + serverHost + ":" + port

@@ -411,6 +411,75 @@ public class TracerStorage {
         } catch (Exception e) { return null; }
     }
 
+    /**
+     * List all sessions as JSON array.
+     */
+    public String listSessionsJson() {
+        StringBuilder sb = new StringBuilder("[");
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                "SELECT session_id, project_name, total_steps, auto_steps, status, started_at, stopped_at " +
+                "FROM sessions ORDER BY started_at DESC")) {
+            boolean first = true;
+            while (rs.next()) {
+                if (!first) sb.append(",");
+                first = false;
+                sb.append("{\"session_id\":\"").append(rs.getString("session_id"))
+                  .append("\",\"project_name\":\"").append(esc(rs.getString("project_name")))
+                  .append("\",\"total_steps\":").append(rs.getInt("total_steps"))
+                  .append(",\"auto_steps\":").append(rs.getInt("auto_steps"))
+                  .append(",\"status\":\"").append(rs.getString("status"))
+                  .append("\",\"started_at\":").append(rs.getLong("started_at"))
+                  .append(",\"stopped_at\":").append(rs.getLong("stopped_at"))
+                  .append("}");
+            }
+        } catch (Exception e) {
+            return "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    /**
+     * Get steps for a session as JSON array.
+     */
+    public String getSessionStepsJson(String sessionId) {
+        StringBuilder sb = new StringBuilder("[");
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT seq, procedure_name, line_number, module_path, thread_name, thread_id, ts, " +
+                "char_start, char_end, stack_depth, parent_seq, stack_json, variables_json " +
+                "FROM steps WHERE session_id = ? ORDER BY seq")) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                boolean first = true;
+                while (rs.next()) {
+                    if (!first) sb.append(",");
+                    first = false;
+                    sb.append("{\"seq\":").append(rs.getInt("seq"))
+                      .append(",\"procedure\":\"").append(esc(rs.getString("procedure_name")))
+                      .append("\",\"line\":").append(rs.getInt("line_number"))
+                      .append(",\"module\":\"").append(esc(rs.getString("module_path")))
+                      .append("\",\"thread_name\":\"").append(esc(rs.getString("thread_name")))
+                      .append("\",\"thread_id\":").append(rs.getInt("thread_id"))
+                      .append(",\"ts\":").append(rs.getLong("ts"))
+                      .append(",\"char_start\":").append(rs.getInt("char_start"))
+                      .append(",\"char_end\":").append(rs.getInt("char_end"))
+                      .append(",\"stack_depth\":").append(rs.getInt("stack_depth"))
+                      .append(",\"parent_seq\":").append(rs.getInt("parent_seq"));
+                    String stackJson = rs.getString("stack_json");
+                    if (stackJson != null) sb.append(",\"stack\":").append(stackJson);
+                    String varsJson = rs.getString("variables_json");
+                    if (varsJson != null) sb.append(",\"variables\":").append(varsJson);
+                    sb.append("}");
+                }
+            }
+        } catch (Exception e) {
+            return "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
     private static String esc(String s) {
         return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
