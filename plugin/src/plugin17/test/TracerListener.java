@@ -229,12 +229,15 @@ public class TracerListener implements IDebugEventSetListener {
         lastProc = ""; lastLine = -1; lastThreadId = -1; lastTs = 0;
         recordingStartTime = System.currentTimeMillis();
 
-        // Create SQLite session (P2)
+        // Create SQLite session (P2) with project auto-detection
         if (storage != null && (storageMode.equals("sqlite") || storageMode.equals("both"))) {
             try {
-                currentSessionId = storage.createSession(null, null, null, null, null);
+                String projectName = detectProjectName();
+                String workspacePath = org.eclipse.core.runtime.Platform.getInstanceLocation().getURL().getPath();
+                currentSessionId = storage.createSession(projectName, workspacePath, null, null, null);
                 storage.startWriter();
-                System.out.println("[tracer] SQLite session: " + currentSessionId);
+                System.out.println("[tracer] SQLite session: " + currentSessionId
+                    + " (project=" + projectName + ")");
             } catch (Exception e) {
                 System.err.println("[tracer] SQLite session error: " + e.getMessage());
                 currentSessionId = null;
@@ -714,6 +717,24 @@ public class TracerListener implements IDebugEventSetListener {
 
     private String getFrameProcedure(IStackFrame frame) {
         try { return frame.getName(); } catch (Exception e) { return ""; }
+    }
+
+    /**
+     * Detect project name from active debug launch.
+     */
+    private String detectProjectName() {
+        try {
+            for (var launch : DebugPlugin.getDefault().getLaunchManager().getLaunches()) {
+                if (launch.isTerminated()) continue;
+                var config = launch.getLaunchConfiguration();
+                if (config != null) {
+                    String project = config.getAttribute("org.eclipse.jdt.launching.PROJECT_ATTR", "");
+                    if (!project.isEmpty()) return project;
+                    return config.getName();
+                }
+            }
+        } catch (Exception e) { /* skip */ }
+        return "";
     }
 
     // --- Debug Session Control API ---
