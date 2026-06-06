@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-tracer-sink — детерминированный оркестратор трейса EDT Debug Tracer.
+tracer-sink — детерминированный оркестратор конкретных сценариев
+использования EDT Debug Tracer.
 
-Контракт: docs/BRD-cli-sink.md, docs/SRS-cli-sink.md
+Субкоманды:
+  trace-session        Полный цикл трейса (POST /sink/run)
+                       Контракт: docs/cli-sink/SRS-trace-session.md
+  breakpoint-metrics   Срез состояния в точке останова (POST /sink/breakpoint)
+                       Контракт: docs/cli-sink/SRS-breakpoint-metrics.md
 
-Алгоритм:
-  1. Разобрать аргументы
-  2. --help / --version
-  3. Прочитать JSON из аргумента или stdin
-  4. Распарсить JSON  → exit 2 при ошибке
-  5. Валидировать поля  → exit 2 при нарушении
-  6. POST /sink/run     → exit 1 при ошибке сети
-  7. Маппинг ответа  → exit 0 / 3 / 4
-Бизнес-логика трейса — в TracerSink.java, не здесь.
+Правило: бизнес-логика трейса и сбора метрик — в Java-компонентах плагина.
+CLI — только валидация контракта, один HTTP-вызов, маппинг ответа в exit code.
 """
 import argparse
 import json
@@ -20,7 +18,7 @@ import sys
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 EXIT_SUCCESS        = 0
 EXIT_NETWORK_ERROR  = 1
@@ -30,13 +28,91 @@ EXIT_INTERNAL_ERROR = 4
 
 VALID_STEP_TYPES = {"into", "over", "return"}
 
-HELP_TEXT = f"""\
-tracer-sink {VERSION}
-Детерминированный оркестратор трейса EDT Debug Tracer.
+# ---------------------------------------------------------------------------
+# Shared I/O
+# ---------------------------------------------------------------------------
+
+def out(data: dict):
+    """Единственная точка записи результата в stdout."""
+    print(json.dumps(data, ensure_ascii=False))
+
+
+def fail(code: int, message: str):
+    out({"ok": False, "error": message, "exit_code": code})
+    sys.exit(code)
+
+
+def read_raw_json(json_arg):
+    """Читает сырой JSON из аргумента или stdin."""
+    if json_arg is not None:
+        raw = json_arg
+    elif not sys.stdin.isatty():
+        raw = sys.stdin.read()
+    else:
+        return None
+    return raw.strip() or None
+
+
+def parse_json(raw: str) -> dict:
+    """Парсит JSON; при ошибке вызывает fail(2)."""
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as e:
+        fail(EXIT_CONTRACT_ERROR, f"невалидный JSON: {e}")
+    if not isinstance(obj, dict):
+        fail(EXIT_CONTRACT_ERROR, "входной JSON должен быть объектом {}")
+    return obj
+
+
+def http_post(host: str, port: int, path: str, body: dict, token, timeout: int) -> dict:
+    """POST запрос; при ошибке сети вызывает fail(1)."""
+    url = f"http://{host}:{port}{path}"
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp_body = resp.read().decode("utf-8")
+    except urllib.error.URLError as e:
+        fail(EXIT_NETWORK_ERROR, f"сервер недоступен ({host}:{port}): {e.reason}")
+    except TimeoutError:
+        fail(EXIT_NETWORK_ERROR, f"таймаут соединения с {host}:{port}")
+    except Exception as e:
+        fail(EXIT_NETWORK_ERROR, f"ошибка сети: {e}")
+    try:
+        return json.loads(resp_body)
+    except json.JSONDecodeError:
+        fail(EXIT_INTERNAL_ERROR, f"сервер вернул невалидный JSON: {resp_body[:200]}")
+
+
+def map_result(result: dict):
+    """Добавляет exit_code в результат и завершает процесс."""
+    if result.get("ok"):
+        result["exit_code"] = EXIT_SUCCESS
+        out(result)
+        sys.exit(EXIT_SUCCESS)
+    else:
+        result["exit_code"] = EXIT_RUNTIME_ERROR
+        out(result)
+        sys.exit(EXIT_RUNTIME_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: trace-session
+# ---------------------------------------------------------------------------
+
+HELP_TRACE_SESSION = f"""\
+tracer-sink trace-session {VERSION}
+Детерминированный оркестратор полного цикла трейса EDT Debug Tracer.
+Контракт: docs/cli-sink/SRS-trace-session.md
 
 ИСПОЛЬЗОВАНИЕ:
-  tracer-sink [OPTIONS] [JSON]
-  echo '{{...}}' | tracer-sink [OPTIONS]
+  tracer-sink trace-session [OPTIONS] [JSON]
+  echo '{{...}}' | tracer-sink trace-session [OPTIONS]
 
 ОБЯЗАТЕЛЬНЫЕ ПОЛЯ JSON:
   project       string   Имя проекта в EDT workspace
@@ -62,135 +138,219 @@ OPTIONS:
   --token TOKEN  Bearer-токен авторизации
   --timeout SEC  Таймаут HTTP-запроса в секундах (по умолчанию: 120)
   --help         Эта справка
-  --version      Версия CLI
 """
 
 
-def out(data: dict):
-    """Единственная точка записи результата в stdout."""
-    print(json.dumps(data, ensure_ascii=False))
-
-
-def fail(code: int, message: str):
-    out({"ok": False, "error": message, "exit_code": code})
-    sys.exit(code)
-
-
-def validate(req: dict):
-    """Возвращает сообщение об ошибке или None."""
+def validate_trace_session(req: dict):
     project = req.get("project", "")
     if not isinstance(project, str) or not project.strip():
-        return "\u043f\u043e\u043b\u0435 'project' \u043e\u0431\u044f\u0437\u0430\u0442\u0435\u043b\u044c\u043d\u043e \u0438 \u043d\u0435 \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u043f\u0443\u0441\u0442\u044b\u043c"
+        return "поле 'project' обязательно и не должно быть пустым"
 
     max_steps = req.get("maxSteps", 0)
     if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 0:
-        return f"\u043f\u043e\u043b\u0435 'maxSteps' \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u0446\u0435\u043b\u044b\u043c \u0447\u0438\u0441\u043b\u043e\u043c >= 0, \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u043e: {max_steps!r}"
+        return f"поле 'maxSteps' должно быть целым числом >= 0, получено: {max_steps!r}"
 
     step_type = req.get("stepType", "into")
     if step_type not in VALID_STEP_TYPES:
-        return f"\u043f\u043e\u043b\u0435 'stepType' \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u043e\u0434\u043d\u0438\u043c \u0438\u0437 {sorted(VALID_STEP_TYPES)}, \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u043e: {step_type!r}"
+        return f"поле 'stepType' должно быть одним из {sorted(VALID_STEP_TYPES)}, получено: {step_type!r}"
 
     timeout_ms = req.get("timeoutMs", 30000)
     if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms <= 0:
-        return f"\u043f\u043e\u043b\u0435 'timeoutMs' \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u0446\u0435\u043b\u044b\u043c \u0447\u0438\u0441\u043b\u043e\u043c > 0, \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u043e: {timeout_ms!r}"
+        return f"поле 'timeoutMs' должно быть целым числом > 0, получено: {timeout_ms!r}"
 
     return None
 
 
-def run(raw_json: str, host: str, port: int, token, http_timeout: int):
-    # --- шаг 5: парсинг JSON ---
+def cmd_trace_session(argv):
+    p = argparse.ArgumentParser(prog="tracer-sink trace-session", add_help=False)
+    p.add_argument("json_input", nargs="?", default=None)
+    p.add_argument("--host",    default="localhost")
+    p.add_argument("--port",    type=int, default=18080)
+    p.add_argument("--token",   default=None)
+    p.add_argument("--timeout", type=int, default=120, dest="http_timeout")
+    p.add_argument("--help",    action="store_true")
+
     try:
-        req = json.loads(raw_json)
-    except json.JSONDecodeError as e:
-        fail(EXIT_CONTRACT_ERROR, f"\u043d\u0435\u0432\u0430\u043b\u0438\u0434\u043d\u044b\u0439 JSON: {e}")
+        args = p.parse_args(argv)
+    except SystemExit:
+        fail(EXIT_CONTRACT_ERROR, "ошибка разбора аргументов, используйте --help")
 
-    if not isinstance(req, dict):
-        fail(EXIT_CONTRACT_ERROR, "\u0432\u0445\u043e\u0434\u043d\u043e\u0439 JSON \u0434\u043e\u043b\u0436\u0435\u043d \u0431\u044b\u0442\u044c \u043e\u0431\u044a\u0435\u043a\u0442\u043e\u043c {}")
+    if args.help:
+        print(HELP_TRACE_SESSION, end="")
+        sys.exit(EXIT_SUCCESS)
 
-    # --- шаг 6: валидация контракта ---
-    err = validate(req)
+    raw = read_raw_json(args.json_input)
+    if not raw:
+        print(HELP_TRACE_SESSION, end="", file=sys.stderr)
+        fail(EXIT_CONTRACT_ERROR, "не передан входной JSON (аргумент или stdin)")
+
+    req = parse_json(raw)
+
+    err = validate_trace_session(req)
     if err:
         fail(EXIT_CONTRACT_ERROR, err)
 
-    # --- шаг 7: HTTP POST /sink/run ---
-    url = f"http://{host}:{port}/sink/run"
-    body = json.dumps(req, ensure_ascii=False).encode("utf-8")
-    http_req = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    if token:
-        http_req.add_header("Authorization", f"Bearer {token}")
+    result = http_post(args.host, args.port, "/sink/run", req, args.token, args.http_timeout)
+    map_result(result)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: breakpoint-metrics
+# ---------------------------------------------------------------------------
+
+HELP_BREAKPOINT_METRICS = f"""\
+tracer-sink breakpoint-metrics {VERSION}
+Детерминированный оркестратор сбора показателей состояния программы
+в заданной точке останова EDT Debug Tracer.
+Контракт: docs/cli-sink/SRS-breakpoint-metrics.md
+
+ИСПОЛЬЗОВАНИЕ:
+  tracer-sink breakpoint-metrics [OPTIONS] [JSON]
+  echo '{{...}}' | tracer-sink breakpoint-metrics [OPTIONS]
+
+ОБЯЗАТЕЛЬНЫЕ ПОЛЯ JSON:
+  project       string   Имя проекта в EDT workspace
+  file          string   Путь к файлу относительно корня проекта
+  line          int>0    Номер строки точки останова
+
+ОПЦИОНАЛЬНЫЕ ПОЛЯ JSON:
+  variables     string[] Список имён переменных (пусто = все доступные)
+  mainClass     string   Точка входа (по умолчанию: "")
+  args          string   Аргументы запуска (по умолчанию: "")
+  timeoutMs     int>0    Таймаут ожидания точки останова в мс (по умолчанию: 30000)
+
+EXIT CODES:
+  0  SUCCESS        — точка достигнута, срез собран
+  1  NETWORK_ERROR  — HTTP-сервер недоступен
+  2  CONTRACT_ERROR — невалидный входной JSON
+  3  RUNTIME_ERROR  — точка не достигнута за timeoutMs или ошибка запуска
+  4  INTERNAL_ERROR — внутренняя ошибка CLI
+
+OPTIONS:
+  --host HOST    Адрес сервера (по умолчанию: localhost)
+  --port PORT    Порт сервера (по умолчанию: 18080)
+  --token TOKEN  Bearer-токен авторизации
+  --timeout SEC  Таймаут HTTP-запроса в секундах (по умолчанию: 120)
+  --help         Эта справка
+"""
+
+
+def validate_breakpoint_metrics(req: dict):
+    project = req.get("project", "")
+    if not isinstance(project, str) or not project.strip():
+        return "поле 'project' обязательно и не должно быть пустым"
+
+    file_ = req.get("file", "")
+    if not isinstance(file_, str) or not file_.strip():
+        return "поле 'file' обязательно и не должно быть пустым"
+
+    line = req.get("line")
+    if line is None:
+        return "поле 'line' обязательно"
+    if not isinstance(line, int) or isinstance(line, bool) or line <= 0:
+        return f"поле 'line' должно быть целым числом > 0, получено: {line!r}"
+
+    variables = req.get("variables", [])
+    if not isinstance(variables, list):
+        return f"поле 'variables' должно быть массивом строк, получено: {type(variables).__name__}"
+    for i, v in enumerate(variables):
+        if not isinstance(v, str):
+            return f"поле 'variables[{i}]' должно быть строкой, получено: {v!r}"
+
+    timeout_ms = req.get("timeoutMs", 30000)
+    if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms <= 0:
+        return f"поле 'timeoutMs' должно быть целым числом > 0, получено: {timeout_ms!r}"
+
+    return None
+
+
+def cmd_breakpoint_metrics(argv):
+    p = argparse.ArgumentParser(prog="tracer-sink breakpoint-metrics", add_help=False)
+    p.add_argument("json_input", nargs="?", default=None)
+    p.add_argument("--host",    default="localhost")
+    p.add_argument("--port",    type=int, default=18080)
+    p.add_argument("--token",   default=None)
+    p.add_argument("--timeout", type=int, default=120, dest="http_timeout")
+    p.add_argument("--help",    action="store_true")
 
     try:
-        with urllib.request.urlopen(http_req, timeout=http_timeout) as resp:
-            resp_body = resp.read().decode("utf-8")
-    except urllib.error.URLError as e:
-        fail(EXIT_NETWORK_ERROR, f"\u0441\u0435\u0440\u0432\u0435\u0440 \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d ({host}:{port}): {e.reason}")
-    except TimeoutError:
-        fail(EXIT_NETWORK_ERROR, f"\u0442\u0430\u0439\u043c\u0430\u0443\u0442 \u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u044f \u0441 {host}:{port}")
-    except Exception as e:
-        fail(EXIT_NETWORK_ERROR, f"\u043e\u0448\u0438\u0431\u043a\u0430 \u0441\u0435\u0442\u0438: {e}")
+        args = p.parse_args(argv)
+    except SystemExit:
+        fail(EXIT_CONTRACT_ERROR, "ошибка разбора аргументов, используйте --help")
 
-    # --- шаг 8: разбор ответа ---
-    try:
-        result = json.loads(resp_body)
-    except json.JSONDecodeError:
-        fail(EXIT_INTERNAL_ERROR, f"\u0441\u0435\u0440\u0432\u0435\u0440 \u0432\u0435\u0440\u043d\u0443\u043b \u043d\u0435\u0432\u0430\u043b\u0438\u0434\u043d\u044b\u0439 JSON: {resp_body[:200]}")
-
-    if result.get("ok"):
-        result["exit_code"] = EXIT_SUCCESS
-        out(result)
+    if args.help:
+        print(HELP_BREAKPOINT_METRICS, end="")
         sys.exit(EXIT_SUCCESS)
-    else:
-        result["exit_code"] = EXIT_RUNTIME_ERROR
-        out(result)
-        sys.exit(EXIT_RUNTIME_ERROR)
+
+    raw = read_raw_json(args.json_input)
+    if not raw:
+        print(HELP_BREAKPOINT_METRICS, end="", file=sys.stderr)
+        fail(EXIT_CONTRACT_ERROR, "не передан входной JSON (аргумент или stdin)")
+
+    req = parse_json(raw)
+
+    err = validate_breakpoint_metrics(req)
+    if err:
+        fail(EXIT_CONTRACT_ERROR, err)
+
+    result = http_post(args.host, args.port, "/sink/breakpoint", req, args.token, args.http_timeout)
+    map_result(result)
+
+
+# ---------------------------------------------------------------------------
+# Top-level dispatcher
+# ---------------------------------------------------------------------------
+
+HELP_TOP = f"""\
+tracer-sink {VERSION}
+Детерминированный оркестратор конкретных сценариев использования EDT Debug Tracer.
+
+ИСПОЛЬЗОВАНИЕ:
+  tracer-sink <СУБКОМАНДА> [OPTIONS] [JSON]
+
+СУБКОМАНДЫ:
+  trace-session        Полный цикл трейса (POST /sink/run)
+  breakpoint-metrics   Срез состояния в точке останова (POST /sink/breakpoint)
+
+ОПЦИИ (верхний уровень):
+  --version      Версия CLI
+  --help         Эта справка
+
+Справка по субкоманде:
+  tracer-sink trace-session --help
+  tracer-sink breakpoint-metrics --help
+"""
+
+SUBCOMMANDS = {
+    "trace-session":      cmd_trace_session,
+    "breakpoint-metrics": cmd_breakpoint_metrics,
+}
 
 
 def main():
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("json_input", nargs="?", default=None)
-    parser.add_argument("--host",    default="localhost")
-    parser.add_argument("--port",    type=int, default=18080)
-    parser.add_argument("--token",   default=None)
-    parser.add_argument("--timeout", type=int, default=120, dest="http_timeout")
-    parser.add_argument("--help",    action="store_true")
-    parser.add_argument("--version", action="store_true")
+    args = sys.argv[1:]
 
-    try:
-        args = parser.parse_args()
-    except SystemExit:
-        fail(EXIT_CONTRACT_ERROR, "\u043e\u0448\u0438\u0431\u043a\u0430 \u0440\u0430\u0437\u0431\u043e\u0440\u0430 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u043e\u0432, \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 --help")
-
-    if args.help:
-        print(HELP_TEXT, end="")
+    if not args or args[0] in ("--help", "-h"):
+        print(HELP_TOP, end="")
         sys.exit(EXIT_SUCCESS)
 
-    if args.version:
+    if args[0] in ("--version", "-v"):
         print(f"tracer-sink {VERSION}")
         sys.exit(EXIT_SUCCESS)
 
-    # --- шаг 4: чтение JSON ---
-    if args.json_input is not None:
-        raw = args.json_input
-    elif not sys.stdin.isatty():
-        raw = sys.stdin.read()
-    else:
-        print(HELP_TEXT, end="", file=sys.stderr)
-        fail(EXIT_CONTRACT_ERROR, "\u043d\u0435 \u043f\u0435\u0440\u0435\u0434\u0430\u043d \u0432\u0445\u043e\u0434\u043d\u043e\u0439 JSON (\u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442 \u0438\u043b\u0438 stdin)")
+    subcmd = args[0]
+    if subcmd not in SUBCOMMANDS:
+        fail(EXIT_CONTRACT_ERROR,
+             f"неизвестная субкоманда: {subcmd!r}. "
+             f"Доступные: {', '.join(sorted(SUBCOMMANDS))}. "
+             f"Используйте --help.")
 
-    raw = raw.strip()
-    if not raw:
-        fail(EXIT_CONTRACT_ERROR, "\u0432\u0445\u043e\u0434\u043d\u043e\u0439 JSON \u043f\u0443\u0441\u0442\u043e\u0439")
-
-    # --- шаги 5-9 ---
     try:
-        run(raw, args.host, args.port, args.token, args.http_timeout)
+        SUBCOMMANDS[subcmd](args[1:])
     except SystemExit:
         raise
     except Exception as e:
-        fail(EXIT_INTERNAL_ERROR, f"\u0432\u043d\u0443\u0442\u0440\u0435\u043d\u043d\u044f\u044f \u043e\u0448\u0438\u0431\u043a\u0430: {type(e).__name__}: {e}")
+        fail(EXIT_INTERNAL_ERROR, f"внутренняя ошибка: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
