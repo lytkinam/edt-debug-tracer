@@ -1,6 +1,6 @@
 # SRS — CLI-Сток: метод `breakpoint-metrics`
 
-**Версия:** 1.0  
+**Версия:** 1.1  
 **Дата:** 2026-06-06  
 **Репозиторий:** lytkinam/edt-debug-tracer, ветка `feature/trace-sink`  
 **Связанный документ:** docs/cli-sink/BRD-breakpoint-metrics.md  
@@ -10,29 +10,32 @@
 
 ## 1. Обзор
 
-Метод `breakpoint-metrics` — команда CLI-стока `tracer-sink`, которая реализует
-детерминированный оркестратор сбора показателей состояния программы в
-заданной точке останова через `POST /sink/breakpoint` на HTTP-сервере
-плагина EDT Debug Tracer.
+Метод `breakpoint-metrics` — детерминированный оркестратор: выполняет **7 шагов**
+(проверочный + 6 рабочих) через HTTP-сток и возвращает срез состояния программы
+в заданной точке останова.
+
+Контракты каждого HTTP-вызова: [docs/MCP-HTTP/README.md](../MCP-HTTP/README.md)
 
 ```
 stdin / args
      │
      ▼
-┌─────────────────────────────────────────┐
+┌───────────────────────────────────────┐
 │  tracer-sink breakpoint-metrics         │
 │                                         │
-│  1. Валидация JSON-контракта            │
-│  2. POST /sink/breakpoint               │
-│  3. Маппинг ответа → exit code          │
-│  4. JSON-срез состояния в stdout        │
-└────────────────┬────────────────────────┘
-                 │ HTTP POST
+│  [Ш.0] GET  /mcp/capabilities           │
+│  [Ш.0.5] Валидация JSON                  │
+│  [Ш.1] set_breakpoint  → session_id   │
+│  [Ш.2] resume                           │
+│  [Ш.3] poll_break_status (loop 250ms)  │
+│  [Ш.4] get_call_stack  → frameId       │
+│  [Ш.5] get_variables   (filter на CLI) │
+│  [Ш.6] suspend         (ошибка OK)    │
+│  JSON → stdout, exit code                │
+└───────────────────────────────────────┘
+                 │ 7 HTTP-вызовов
                  ▼
-  TestActivator:18080/sink/breakpoint
-                 │
-                 ▼
-   BreakpointMetricsSink.collect()
+  MCP Server :18080/mcp  (и GET /mcp/capabilities)
 ```
 
 ---
@@ -57,37 +60,35 @@ tracer-sink breakpoint-metrics [OPTIONS] [JSON]
 |---|---|
 | `--host HOST` | Адрес HTTP-сервера (по умолчанию: `localhost`) |
 | `--port PORT` | Порт HTTP-сервера (по умолчанию: `18080`) |
-| `--token TOKEN` | Bearer-токен авторизации |
-| `--timeout SEC` | Таймаут HTTP-запроса в секундах (по умолчанию: `120`) |
+| `--poll-interval MS` | Интервал опроса в мс (по умолчанию: `250`) |
 | `--help` | Справка по методу |
 
 ---
 
 ## 3. Входной контракт (BreakpointMetricsRequest)
 
-Входной JSON обязан пройти валидацию **до** обращения к HTTP-серверу.
-При провале валидации — немедленно exit 2.
+Входной JSON валидируется **до** любых HTTP-обращений. При ошибке — немедленно exit 2.
 
 ### 3.1 Поля
 
 | Поле | Тип | Обязательное | По умолчанию | Описание |
 |------|-----|:---:|---|---|
-| `project` | string | ✓ | — | Имя проекта 1C в EDT workspace |
-| `file` | string | ✓ | — | Путь к файлу относительно корня проекта |
-| `line` | integer > 0 | ✓ | — | Номер строки точки останова |
-| `variables` | string[] | — | `[]` | Список имён переменных для сбора (пусто = все доступные) |
-| `mainClass` | string | — | `""` | Точка входа (класс или модуль) |
+| `project` | string | ✅ | — | Имя проекта 1C в EDT workspace |
+| `file` | string | ✅ | — | Путь к файлу относительно корня проекта |
+| `line` | integer > 0 | ✅ | — | Номер строки точки останова |
+| `variables` | string[] | — | `[]` | Имена переменных (пусто = все доступные) |
+| `mainClass` | string | — | `""` | Точка входа |
 | `args` | string | — | `""` | Аргументы запуска |
-| `timeoutMs` | integer > 0 | — | `30000` | Таймаут ожидания точки останова в мс |
+| `timeoutMs` | integer > 0 | — | `30000` | Общий таймаут ожидания точки останова |
 
 ### 3.2 Правила валидации
 
-- `project` — непустая строка → exit 2 при нарушении.
-- `file` — непустая строка → exit 2 при нарушении.
-- `line` — целое число > 0 → exit 2 при нарушении.
+- `project` — непустая строка → exit 2.
+- `file` — непустая строка → exit 2.
+- `line` — целое число > 0 → exit 2.
 - `variables` — массив строк (может быть пустым) → exit 2 если не массив.
-- `timeoutMs` — целое число > 0 → exit 2 при нарушении.
-- JSON должен быть синтаксически корректным → exit 2 при ошибке парсинга.
+- `timeoutMs` — целое число > 0 → exit 2.
+- JSON должен быть синтаксически корректным → exit 2.
 
 ### 3.3 Пример
 
@@ -125,7 +126,7 @@ tracer-sink breakpoint-metrics [OPTIONS] [JSON]
   "variables": {
     "Результат": "Истина",
     "ТекущийОбъект": "Справочник.Номенклатура",
-    "Ошибка": "Неопределено"
+    "Ошибка": "Неопределенно"
   }
 }
 ```
@@ -135,7 +136,7 @@ tracer-sink breakpoint-metrics [OPTIONS] [JSON]
 ```json
 {
   "ok": false,
-  "error": "breakpoint not reached within 30000ms",
+  "error": "poll_break_status: timeout 60000ms exceeded",
   "exit_code": 3
 }
 ```
@@ -147,29 +148,66 @@ tracer-sink breakpoint-metrics [OPTIONS] [JSON]
 | Код | Константа | Условие | Действие агента |
 |-----|-----------|---------|----------------|
 | `0` | `SUCCESS` | Точка достигнута, срез собран | Читать `variables`, `callStack` |
-| `1` | `NETWORK_ERROR` | HTTP недоступен / timeout соединения | Проверить, запущен ли сервер |
+| `1` | `NETWORK_ERROR` | HTTP недоступен / метод не реализован | Проверить MCP Server; если сервер готов — ждать реализации метода |
 | `2` | `CONTRACT_ERROR` | Невалидный JSON или обязательные поля | Исправить входной JSON |
-| `3` | `RUNTIME_ERROR` | Точка не достигнута за `timeoutMs`, или ошибка запуска | Проверить путь, строку, логику программы |
+| `3` | `RUNTIME_ERROR` | Точка не достигнута за `timeoutMs`, отсутствующий метод | Проверить путь, строку, дождаться реализации в HTTP-стоке |
 | `4` | `INTERNAL_ERROR` | Неожиданное исключение CLI | Сообщить разработчику |
 
 ---
 
-## 6. Алгоритм выполнения
+## 6. Алгоритм оркестрации
 
 ```
-1. Разобрать аргументы
-2. --help → вывести справку, exit 0
-3. Прочитать JSON из аргумента или stdin
-4. Распарсить JSON
-   └── ошибка → stdout: {"ok":false,"error":"..."}, exit 2
-5. Валидировать поля (§3.2)
-   └── ошибка → stdout: {"ok":false,"error":"..."}, exit 2
-6. POST http://{host}:{port}/sink/breakpoint
-   ├── ошибка соединения / таймаут → exit 1
-   └── успех → разобрать ответ
-7. ok==true  → stdout: ответ + "exit_code":0, exit 0
-   ok==false → stdout: ответ + "exit_code":3, exit 3
-8. Непредвиденное исключение → exit 4
+1.  Разобрать аргументы
+2.  --help → вывести справку, exit 0
+
+[ШАГ 0] GET /mcp/capabilities
+    └── ошибка сети → exit 1
+    └── set_breakpoint отсутствует в methods[] →
+        stdout: {"ok":false,"error":"set_breakpoint не реализован"}, exit 3
+    └── poll_break_status отсутствует →
+        stdout: {"ok":false,"error":"poll_break_status не реализован"}, exit 3
+
+[ШАГ 0.5] Разобрать JSON из аргумента / stdin
+    └── ошибка парсинга → stdout: {"ok":false,...}, exit 2
+    └── ошибка валидации (§3.2) → stdout: {"ok":false,...}, exit 2
+
+[ШАГ 1] set_breakpoint(project, file, line)
+    └── session_id ← из ответа
+    └── ошибка сети → exit 1
+    └── ошибка JSON-RPC → exit 3
+
+[ШАГ 2] resume(project, threadId)
+    └── threadId ← из debug_status
+    └── ошибка JSON-RPC → exit 3
+
+[ШАГ 3] polling loop: poll_break_status(project, session_id)
+    deadline = now() + timeoutMs
+    while now() < deadline:
+        response = POST /mcp {poll_break_status, session_id}
+        if network_error: sleep(pollIntervalMs); continue  # до 3 раз
+        if suspended == true:
+            threadId ← response.threadId
+            break
+        sleep(pollIntervalMs)
+    if deadline прошёл:
+        stdout: {"ok":false,"error":"timeout"}, exit 3
+
+[ШАГ 4] get_call_stack(project, threadId, session_id)
+    └── frameId ← frames[0].frameId
+    └── frames пусты → exit 3 «пустой стек»
+
+[ШАГ 5] get_variables(project, threadId, frameId, session_id)
+    └── если variables[] != [] — оркестратор фильтрует ответ по перечню имён
+    └── HTTP возвращает все переменные фрейма — фильтрация на стороне CLI
+
+[ШАГ 6] suspend(project, threadId, session_id)
+    └── ошибка не блокирует exit 0 — данные уже собраны
+
+stdout: {ok, session_id, hit, file, line, durationMs, callStack, variables}
+exit 0
+
+9. Непредвиденное исключение → exit 4
 ```
 
 ---
@@ -178,9 +216,11 @@ tracer-sink breakpoint-metrics [OPTIONS] [JSON]
 
 | Требование | Значение |
 |---|---|
-| Время старта CLI | < 200 мс (без HTTP) |
+| Время старта CLI (без HTTP) | < 200 мс |
 | Зависимости | Только stdlib Python 3.8+ |
 | Совместимость ОС | Linux, macOS, Windows |
+| Интервал опроса по умолчанию | 250 мс |
+| Максимум повторов при сетевой ошибке | 3 раза |
 
 ---
 
@@ -188,13 +228,17 @@ tracer-sink breakpoint-metrics [OPTIONS] [JSON]
 
 | ID | Сценарий | Входные данные | Ожидаемый exit |
 |----|----------|---------------|---------------|
-| T-01 | Точка достигнута, переменные собраны | Валидный JSON, сервер доступен | 0 |
+| T-01 | Точка достигнута, переменные собраны | Валидный JSON, все методы есть | 0 |
 | T-02 | Сервер не запущен | Валидный JSON, порт закрыт | 1 |
-| T-03 | Пустой project | `{"project":"","file":"X","line":1}` | 2 |
-| T-04 | Отсутствует file | `{"project":"X","line":1}` | 2 |
-| T-05 | line = 0 | `{"project":"X","file":"X","line":0}` | 2 |
-| T-06 | variables не массив | `{"project":"X","file":"X","line":1,"variables":"Результат"}` | 2 |
-| T-07 | Невалидный JSON | `{project:X}` | 2 |
-| T-08 | Точка не достигнута (таймаут) | Валидный JSON, точка на недостижимой строке | 3 |
-| T-09 | --help | — | 0 |
-| T-10 | JSON из stdin | `echo '{...}' \| tracer-sink breakpoint-metrics` | 0 |
+| T-03 | `set_breakpoint` отсутствует в capabilities | Валидный JSON, сервер готов | 3 |
+| T-04 | `poll_break_status` отсутствует в capabilities | Валидный JSON, сервер готов | 3 |
+| T-05 | Пустой `project` | `{"project":"","file":"X","line":1}` | 2 |
+| T-06 | Отсутствует `file` | `{"project":"X","line":1}` | 2 |
+| T-07 | `line` = 0 | `{"project":"X","file":"X","line":0}` | 2 |
+| T-08 | `variables` не массив | `{...,"variables":"Результат"}` | 2 |
+| T-09 | Невалидный JSON | `{project:X}` | 2 |
+| T-10 | Точка не достигнута (таймаут) | Валидный JSON, точка на недостижимой строке | 3 |
+| T-11 | Разрыв сети на шаге 3 (поллинг), восстановление | Сервер возобновляется в течение 3 попыток | 0 |
+| T-12 | Фильтрация переменных | `variables=["X"]`, в ответе X и Y | 0, в `variables` только X |
+| T-13 | --help | — | 0 |
+| T-14 | JSON из stdin | `echo '{...}' \| tracer-sink breakpoint-metrics` | 0 |
