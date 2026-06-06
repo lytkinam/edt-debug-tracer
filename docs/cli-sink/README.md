@@ -18,6 +18,24 @@
 
 ---
 
+## Принцип независимости: оркестратор не ждёт HTTP-сток
+
+> **Оркестратор реализует код по заявленному контракту и не блокируется на готовность HTTP-стока.**
+
+Правило простое: пока HTTP-сток не реализовал метод, вызов вернёт `exit 1` (нет
+соединения) или `exit 3` (ошибка JSON-RPC). Агент по этому exit code
+поймёт, что HTTP-сток ещё не готов.
+
+Такая стратегия даёт три преимущества:
+
+1. **Параллельная разработка** — CLI и HTTP-сток разрабатываются независимо;
+2. **Контракт является истиной** — если HTTP-сток реализует контракт верно, CLI работает без правок;
+3. **Отклонения видны** — если HTTP-сток не может выполнить контракт, он обновляет
+   `SRS-{method}.md` в `docs/MCP-HTTP` и уведомляет оркестратора. Тогда оркестратор
+   адаптирует свою реализацию.
+
+---
+
 ## Стандарт документации метода
 
 Каждый метод (subcommand) CLI-стока описывается парой документов:
@@ -34,17 +52,18 @@
 | Subcommand | Статус | Описание | HTTP-вызовов | Документы |
 |---|:---:|---|:---:|---|
 | `trace-session` | ✅ готов | Полный цикл трейса | 1 (`POST /sink/run`) | [BRD](BRD-trace-session.md) · [SRS](SRS-trace-session.md) |
-| `breakpoint-metrics` | ⚠️ требует `set_breakpoint` | Срез состояния в точке останова | 6 (`POST /mcp`) | [BRD](BRD-breakpoint-metrics.md) · [SRS](SRS-breakpoint-metrics.md) |
+| `breakpoint-metrics` | ⚠️ ждёт `set_breakpoint` | Срез состояния в точке останова | 6 (`POST /mcp`) | [BRD](BRD-breakpoint-metrics.md) · [SRS](SRS-breakpoint-metrics.md) |
 
-> ⚠️ `breakpoint-metrics` заблокирован до реализации `set_breakpoint` в HTTP-стоке  
-> (см. [docs/MCP-HTTP/BRD-set_breakpoint.md](../MCP-HTTP/BRD-set_breakpoint.md)).
+> ⚠️ `breakpoint-metrics` реализован по контракту. Ждёт реализацию `set_breakpoint` в HTTP-стоке  
+> (см. [docs/MCP-HTTP/BRD-set_breakpoint.md](../MCP-HTTP/BRD-set_breakpoint.md)).  
+> До этого метод возвращает `exit 1` или `exit 3` — агент сориентируется по ним.
 
 ---
 
 ## Оркестрация `breakpoint-metrics`
 
 Оркестратор выполняет **6 последовательных HTTP-вызова** через `POST /mcp`.
-Каждый вызов атомарен: HTTP-сток не знает о сценарии.
+Контракты каждого вызова: [docs/MCP-HTTP/README.md](../MCP-HTTP/README.md)
 
 ```
  ВХОД: {project, file, line, variables[], timeoutMs}
@@ -74,8 +93,6 @@
   stdout: {ok, session_id, hit, file, line, durationMs, callStack, variables}
   exit 0
 ```
-
-Контракты HTTP-вызовов: [docs/MCP-HTTP/README.md](../MCP-HTTP/README.md)
 
 ---
 
@@ -116,7 +133,7 @@ echo '{...}' | tracer-sink <subcommand> [OPTIONS]
 | Code | Константа | Условие | Действие агента |
 |---|---|---|---|
 | 0 | SUCCESS | Сценарий завершён | Читать stdout JSON |
-| 1 | NETWORK_ERROR | HTTP-сервер недоступен | Проверить, запущен ли MCP Server |
+| 1 | NETWORK_ERROR | HTTP-сервер недоступен или метод не реализован | Проверить MCP Server; если HTTP готов, ожидать реализации метода |
 | 2 | CONTRACT_ERROR | Невалидный входной JSON | Исправить поля входа |
 | 3 | RUNTIME_ERROR | Ошибка выполнения сценария | Читать `error` в stdout |
 | 4 | INTERNAL_ERROR | Непредвиденное исключение CLI | Сообщить разработчику |
