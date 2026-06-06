@@ -16,8 +16,10 @@ public class TestActivator implements BundleActivator {
     private TracerListener tracer;
     private TracerStorage storage;
     private TracerBreakpoints breakpoints;
+    private TracerSink sink;          // << новый сток
     private int port = 18080;
     private String outputPath;
+    private String cfgDirPath;        // базовый каталог для выходных файлов
 
     // P9: server config
     private String serverHost = "localhost";
@@ -33,6 +35,7 @@ public class TestActivator implements BundleActivator {
         // Read config from workspace, not from user.home
         String workspacePath = Platform.getInstanceLocation().getURL().getPath();
         File cfgDir = new File(workspacePath, ".edt-debug-tracer");
+        cfgDirPath = cfgDir.getAbsolutePath();
         File cfgFile = new File(cfgDir, "tracer.properties");
 
         Properties props = new Properties();
@@ -78,6 +81,9 @@ public class TestActivator implements BundleActivator {
         DebugPlugin.getDefault().addDebugEventListener(tracer);
         breakpoints = new TracerBreakpoints();
 
+        // Инициализация стока
+        sink = new TracerSink(tracer, storage, cfgDirPath);
+
         // P9: read server config
         serverHost = props.getProperty("server.host", "localhost");
         serverBacklog = Integer.parseInt(props.getProperty("server.backlog", "50"));
@@ -88,6 +94,34 @@ public class TestActivator implements BundleActivator {
         serverAuthScheme = props.getProperty("server.auth.scheme", "Bearer");
 
         server = HttpServer.create(new java.net.InetSocketAddress(serverHost, port), serverBacklog);
+
+        // ── SINK ENDPOINT ─────────────────────────────────────────────────────
+        // POST /sink/run
+        // Вход:  { "project": "...", "mainClass": "...", "args": "",
+        //          "maxSteps": 0, "stepType": "into", "saveJson": true,
+        //          "timeoutMs": 30000 }
+        // Выход: { "ok": true, "session_id": "...", "totalSteps": N,
+        //          "durationMs": N, "json_path": "...", "steps": [...] }
+        // Поведение — чистый сток: принимает задание, выполняет полный
+        // цикл (launch → trace → terminate), возвращает результат,
+        // не вызывает ничего снаружи.
+        server.createContext("/sink/run", ex -> {
+            if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
+            if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+                respond(ex, 405, "{\"error\":\"POST required\"}");
+                return;
+            }
+            try {
+                String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                TracerSink.SinkRequest req = TracerSink.SinkRequest.fromJson(body);
+                TracerSink.SinkResult result = sink.run(req);
+                respond(ex, result.ok ? 200 : 500, result.toJson());
+            } catch (Exception e) {
+                respond(ex, 500, "{\"error\":\"" + esc(e.getMessage()) + "\"}");
+            }
+        });
+        // ── END SINK ──────────────────────────────────────────────────────────
+
         server.createContext("/mcp/health", ex -> {
             if (!checkAuth(ex)) { respond(ex, 401, "{\"error\":\"unauthorized\"}"); return; }
             respond(ex, 200, "{\"ok\":true,\"recording\":" + tracer.isRecording()
