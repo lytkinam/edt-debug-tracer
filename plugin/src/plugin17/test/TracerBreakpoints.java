@@ -1,219 +1,174 @@
 package plugin17.test;
 
-import org.eclipse.core.resources.IFile;
-import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.IResource;
-import org.eclipse.core.resources.IWorkspaceRoot;
-import org.eclipse.core.resources.ResourcesPlugin;
-import org.eclipse.core.runtime.CoreException;
-import org.eclipse.core.runtime.Platform;
+import org.eclipse.debug.core.DebugPlugin;
 import org.eclipse.debug.core.model.IBreakpoint;
-import org.osgi.framework.Bundle;
-
-import java.lang.reflect.Method;
 import java.util.*;
 
 /**
- * Manages breakpoints created from trace data.
- * Uses reflective class loading for JDIDebugModel to avoid OSGi NoClassDefFoundError.
+ * Manages breakpoints within the Eclipse/EDT workspace.
+ *
+ * Added in java_debug_tracer branch:
+ *   setLineBreakpoint(typeName, line) — used by TraceSink to place a
+ *   breakpoint programmatically from a "ClassName:line" spec.
  */
 public class TracerBreakpoints {
 
-    private final List<IBreakpoint> managedBreakpoints = new ArrayList<>();
-    private Method createLineBreakpointMethod;
-    private boolean jdtDebugAvailable = false;
+    /** Breakpoints created by this manager (so we can selectively clear them). */
+    private final List<IBreakpoint> managed = new ArrayList<>();
 
-    public TracerBreakpoints() {
-        initJdtDebug();
-    }
+    // -------------------------------------------------------------------------
+    // Public API used by TraceSink
+    // -------------------------------------------------------------------------
 
     /**
-     * Initialize JDT Debug API via bundle classloader.
+     * Sets a Java line breakpoint on {@code typeName} at {@code line}.
+     * Uses JDIDebugModel via reflection (same pattern as setFromTrace).
+     *
+     * @param typeName fully-qualified class name, e.g. "com.example.Foo"
+     * @param line     1-based line number
+     * @return true if the breakpoint was successfully created
      */
-    private void initJdtDebug() {
+    public boolean setLineBreakpoint(String typeName, int line) {
         try {
-            Bundle bundle = Platform.getBundle("org.eclipse.jdt.debug");
-            if (bundle == null) {
-                System.err.println("[tracer] org.eclipse.jdt.debug bundle not found");
-                return;
-            }
-            int state = bundle.getState();
-            System.out.println("[tracer] org.eclipse.jdt.debug state: " + state
-                + " (INSTALLED=2, RESOLVED=4, STARTING=8, STOPPING=16, ACTIVE=32)");
+            // Try to get a Java resource for the type — fallback to workspace root
+            org.eclipse.core.resources.IResource resource = findResource(typeName);
 
-            // Start bundle if not active
-            if (state != Bundle.ACTIVE) {
-                System.out.println("[tracer] Starting org.eclipse.jdt.debug bundle...");
-                bundle.start(Bundle.START_ACTIVATION_POLICY);
-                System.out.println("[tracer] Bundle state after start: " + bundle.getState());
-            }
+            Class<?> jdiModel = Class.forName("org.eclipse.jdt.debug.core.JDIDebugModel",
+                true, getClass().getClassLoader());
 
-            // Load class via bundle classloader
-            Class<?> modelClass = bundle.loadClass("org.eclipse.jdt.debug.core.JDIDebugModel");
-            createLineBreakpointMethod = modelClass.getMethod("createLineBreakpoint",
-                IResource.class, String.class, int.class, int.class, int.class, int.class, boolean.class, Map.class);
-            jdtDebugAvailable = true;
-            System.out.println("[tracer] JDIDebugModel loaded successfully via bundle classloader");
+            java.lang.reflect.Method m = jdiModel.getMethod(
+                "createLineBreakpoint",
+                org.eclipse.core.resources.IResource.class,
+                String.class, int.class, int.class, int.class, boolean.class,
+                java.util.Map.class);
+
+            IBreakpoint bp = (IBreakpoint) m.invoke(null,
+                resource, typeName, line,
+                -1, -1,          // char start/end — -1 = unknown
+                true,            // register with BreakpointManager
+                null);           // no attributes map
+
+            if (bp != null) {
+                bp.setEnabled(true);
+                managed.add(bp);
+                System.out.println("[TracerBreakpoints] set bp: " + typeName + ":" + line);
+                return true;
+            }
         } catch (Exception e) {
-            System.err.println("[tracer] JDT Debug init failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-            jdtDebugAvailable = false;
+            System.err.println("[TracerBreakpoints] setLineBreakpoint error: " + e.getMessage());
         }
+        return false;
     }
 
     /**
-     * Set breakpoints from trace entries.
+     * Sets breakpoints from a trace session (existing behaviour).
+     * mode = "start" → first occurrence of each procedure
+     * mode = "end"   → last  occurrence of each procedure
      */
     public int setFromTrace(List<StepEntry> entries, String mode) {
         if (entries == null || entries.isEmpty()) return 0;
-        if (!jdtDebugAvailable) {
-            System.err.println("[tracer] JDT Debug not available, cannot set breakpoints");
-            return 0;
-        }
-
-        // Group by (module, procedure) -> find first/last line
-        Map<String, int[]> procLines = new LinkedHashMap<>();
-        for (StepEntry entry : entries) {
-            String key = entry.module() + "|" + entry.procedure();
-            int[] range = procLines.computeIfAbsent(key, k -> new int[]{entry.line(), entry.line()});
-            range[0] = Math.min(range[0], entry.line());
-            range[1] = Math.max(range[1], entry.line());
-        }
-
-        final int[] count = {0};
-        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
-
-        org.eclipse.core.runtime.jobs.Job.create("Tracer: Set Breakpoints", monitor -> {
-            for (Map.Entry<String, int[]> e : procLines.entrySet()) {
-                String[] parts = e.getKey().split("\\|", 2);
-                String modulePath = parts[0];
-                String procedure = parts.length > 1 ? parts[1] : "";
-                int line = "end".equals(mode) ? e.getValue()[1] : e.getValue()[0];
-
-                try {
-                    IResource resource = resolveResource(modulePath);
-                    if (resource == null) {
-                        System.err.println("[tracer] Cannot resolve: " + modulePath);
-                        continue;
-                    }
-                    String typeName = extractTypeName(modulePath);
-
-                    // Create breakpoint via reflection
-                    IBreakpoint bp = (IBreakpoint) createLineBreakpointMethod.invoke(
-                        null, resource, typeName, line, -1, -1, 0, true, null);
-
-                    if (bp != null) {
-                        bp.getMarker().setAttribute("message",
-                            "[tracer] " + procedure + " @ " + resource.getName() + ":" + line);
-                        managedBreakpoints.add(bp);
-                        count[0]++;
-                    }
-                } catch (Exception ex) {
-                    System.err.println("[tracer] BP error " + modulePath + ":" + line
-                        + " — " + ex.getClass().getSimpleName() + ": " + ex.getMessage());
-                }
+        Map<String, StepEntry> seen = new LinkedHashMap<>();
+        if ("end".equals(mode)) {
+            for (StepEntry e : entries) {
+                String key = e.module + ":" + e.procedure;
+                seen.put(key, e);
             }
-            System.out.println("[tracer] Created " + count[0] + " breakpoints (mode=" + mode + ")");
-            latch.countDown();
-            return org.eclipse.core.runtime.Status.OK_STATUS;
-        }).schedule();
-
-        try {
-            latch.await(10, java.util.concurrent.TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        } else {
+            for (StepEntry e : entries) {
+                String key = e.module + ":" + e.procedure;
+                seen.putIfAbsent(key, e);
+            }
         }
-        return count[0];
+        int count = 0;
+        for (StepEntry e : seen.values()) {
+            if (setBreakpointFromEntry(e)) count++;
+        }
+        return count;
     }
 
-    /**
-     * Clear all managed breakpoints.
-     */
     public void clearAll() {
-        int count = managedBreakpoints.size();
-        for (IBreakpoint bp : managedBreakpoints) {
-            try { bp.delete(); } catch (CoreException e) { /* skip */ }
+        for (IBreakpoint bp : managed) {
+            try {
+                DebugPlugin.getDefault().getBreakpointManager().removeBreakpoint(bp, true);
+            } catch (Exception ignore) {}
         }
-        managedBreakpoints.clear();
-        System.out.println("[tracer] Cleared " + count + " breakpoints");
+        managed.clear();
     }
 
-    /**
-     * List managed breakpoints as JSON.
-     */
     public String listAsJson() {
         StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < managedBreakpoints.size(); i++) {
+        for (int i = 0; i < managed.size(); i++) {
+            IBreakpoint bp = managed.get(i);
             if (i > 0) sb.append(",");
-            IBreakpoint bp = managedBreakpoints.get(i);
             sb.append("{");
             try {
-                sb.append("\"id\":").append(bp.getMarker().getId());
-                sb.append(",\"resource\":\"").append(esc(bp.getMarker().getResource().getName())).append("\"");
-                sb.append(",\"line\":").append(bp.getMarker().getAttribute("lineNumber", -1));
-                sb.append(",\"enabled\":").append(bp.isEnabled());
-                String msg = bp.getMarker().getAttribute("message", "");
-                sb.append(",\"message\":\"").append(esc(msg)).append("\"");
-            } catch (CoreException e) {
-                sb.append("\"error\":\"").append(esc(e.getMessage())).append("\"");
-            }
+                Object m = bp.getMarker();
+                if (m != null) {
+                    java.lang.reflect.Method getType = m.getClass().getMethod("getType");
+                    sb.append("\"type\":\"").append(getType.invoke(m)).append("\"");
+                    java.lang.reflect.Method getAttribute = m.getClass().getMethod(
+                        "getAttribute", String.class, int.class);
+                    int lineNum = (Integer) getAttribute.invoke(m,
+                        "org.eclipse.debug.core.model.ILineBreakpoint.LINE", -1);
+                    sb.append(",\"line\":").append(lineNum);
+                }
+            } catch (Exception ignore) {}
+            sb.append(",\"enabled\":");
+            try { sb.append(bp.isEnabled()); } catch (Exception ex) { sb.append("false"); }
             sb.append("}");
         }
         sb.append("]");
         return sb.toString();
     }
 
-    public int size() { return managedBreakpoints.size(); }
-    public boolean isAvailable() { return jdtDebugAvailable; }
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
 
-    // --- Resource resolution ---
+    private boolean setBreakpointFromEntry(StepEntry e) {
+        try {
+            String module = e.module;
+            String typeName = moduleToTypeName(module);
+            return setLineBreakpoint(typeName, e.line);
+        } catch (Exception ex) {
+            System.err.println("[TracerBreakpoints] setFromEntry: " + ex.getMessage());
+            return false;
+        }
+    }
 
-    private IResource resolveResource(String modulePath) {
-        if (modulePath == null || modulePath.isEmpty()) return null;
-        String path = modulePath;
-        if (path.startsWith("L/")) path = path.substring(2);
-        if (path.startsWith("/")) path = path.substring(1);
+    /** Best-effort: derive a Java type name from Eclipse module path. */
+    private String moduleToTypeName(String module) {
+        // E.g. "L/myproject/src/com/example/Foo.java" → "com.example.Foo"
+        if (module == null) return "";
+        int slash = module.indexOf('/');
+        if (slash >= 0) module = module.substring(slash + 1);
+        // Remove everything up to src/
+        int src = module.indexOf("/src/");
+        if (src >= 0) module = module.substring(src + 5);
+        // Remove .java extension
+        if (module.endsWith(".java")) module = module.substring(0, module.length() - 5);
+        return module.replace('/', '.');
+    }
 
-        IWorkspaceRoot root = ResourcesPlugin.getWorkspace().getRoot();
-
-        // Workspace-relative
-        IFile file = root.getFile(new org.eclipse.core.runtime.Path(path));
-        if (file != null && file.exists()) return file;
-
-        // Extract project name
-        int slash = path.indexOf('/');
-        if (slash > 0) {
-            String projectName = path.substring(0, slash);
-            String filePath = path.substring(slash + 1);
-            IProject project = root.getProject(projectName);
-            if (project != null && project.exists()) {
-                IFile pf = project.getFile(filePath);
-                if (pf != null && pf.exists()) return pf;
-                // Try src/ prefix
-                pf = project.getFile("src/" + filePath);
-                if (pf != null && pf.exists()) return pf;
+    /** Find an IResource for the type, falling back to workspace root. */
+    private org.eclipse.core.resources.IResource findResource(String typeName) {
+        try {
+            org.eclipse.core.resources.IWorkspaceRoot root =
+                org.eclipse.core.resources.ResourcesPlugin.getWorkspace().getRoot();
+            // Try to find the .java file in any project
+            String pathPart = typeName.replace('.', '/') + ".java";
+            for (org.eclipse.core.resources.IProject proj : root.getProjects()) {
+                org.eclipse.core.resources.IResource res =
+                    proj.findMember("src/" + pathPart);
+                if (res != null && res.exists()) return res;
+            }
+            return root;  // fallback
+        } catch (Exception e) {
+            try {
+                return org.eclipse.core.resources.ResourcesPlugin.getWorkspace().getRoot();
+            } catch (Exception ex) {
+                return null;
             }
         }
-        return null;
-    }
-
-    private String extractTypeName(String modulePath) {
-        String path = modulePath;
-        if (path.startsWith("L/")) path = path.substring(2);
-        if (path.startsWith("/")) path = path.substring(1);
-        int srcIdx = path.indexOf("/src/");
-        String relative;
-        if (srcIdx >= 0) {
-            relative = path.substring(srcIdx + 5);
-        } else {
-            relative = path;
-            int slash = relative.indexOf('/');
-            if (slash >= 0) relative = relative.substring(slash + 1);
-        }
-        if (relative.endsWith(".java")) relative = relative.substring(0, relative.length() - 5);
-        return relative.replace('/', '.').replace('\\', '.');
-    }
-
-    private static String esc(String s) {
-        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 }
