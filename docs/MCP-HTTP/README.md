@@ -1,6 +1,6 @@
 # docs/MCP-HTTP — Контракты HTTP-стока
 
-**Версия стандарта:** 1.0  
+**Версия стандарта:** 1.1  
 **Ветка:** `feature/trace-sink`
 
 ---
@@ -19,7 +19,7 @@
 
 ## Стандарт документации метода
 
-Каждый HTTP-метод, используемый оркестратором, описывается парой документов:
+Каждый HTTP-метод описывается парой документов:
 
 | Документ | Назначение |
 |---|---|
@@ -34,20 +34,18 @@
 
 ## Методы оркестратора `breakpoint-metrics`
 
-Ниже перечислены **только те методы**, которые использует оркестратор `breakpoint-metrics`.  
-Остальные методы HTTP-сток документирует самостоятельно.
-
 | Метод | Статус | Шаг сценария | Документы |
 |---|:---:|---|---|
+| `get_capabilities` | ⛔ **ОТСУТСТВУЕТ** | 0 — проверить доступность методов | [BRD](BRD-get_capabilities.md) · [SRS](SRS-get_capabilities.md) |
 | `set_breakpoint` | ⛔ **ОТСУТСТВУЕТ** | 1 — установить точку останова | [BRD](BRD-set_breakpoint.md) · [SRS](SRS-set_breakpoint.md) |
 | `resume` | ✅ есть | 2 — продолжить выполнение программы | [BRD](BRD-resume.md) · [SRS](SRS-resume.md) |
-| `wait_for_break` | ✅ есть | 3 — ждать события SUSPEND | [BRD](BRD-wait_for_break.md) · [SRS](SRS-wait_for_break.md) |
+| `poll_break_status` | ⛔ **ОТСУТСТВУЕТ** | 3 — опросить статус останова (заменяет `wait_for_break`) | [BRD](BRD-poll_break_status.md) · [SRS](SRS-poll_break_status.md) |
 | `get_call_stack` | ✅ есть | 4 — собрать стек вызовов | [BRD](BRD-get_call_stack.md) · [SRS](SRS-get_call_stack.md) |
 | `get_variables` | ✅ есть | 5 — собрать переменные фрейма | [BRD](BRD-get_variables.md) · [SRS](SRS-get_variables.md) |
 | `suspend` | ✅ есть | 6 — остановить поток после сбора | [BRD](BRD-suspend.md) · [SRS](SRS-suspend.md) |
 
-> ⛔ `set_breakpoint` **не реализован** в HTTP-стоке. Оркестратор требует его добавления.  
-> До реализации метод `breakpoint-metrics` не может быть выполнен.
+> ⛔ `get_capabilities`, `set_breakpoint`, `poll_break_status` **не реализованы** в HTTP-стоке.  
+> Оркестратор требует их добавления. До реализации `set_breakpoint` метод `breakpoint-metrics` не может быть выполнен.
 
 ---
 
@@ -63,3 +61,12 @@ Content-Type: application/json
 ```
 
 Оркестратор сам назначает `id` (инкрементально), сам обрабатывает `error` и `result`.
+
+---
+
+## session_id
+
+`session_id` — строковый идентификатор сессии отладки. **Назначается системой** при запуске отладки (на стороне HTTP-стока, при первом вызове `set_breakpoint`).  
+Возвращается в ответе `set_breakpoint` и **передаётся оркестратором** во все последующие вызовы сессии как опциональный фильтр.
+
+Методы, принимающие `session_id`: `set_breakpoint` (возвращает), `get_call_stack`, `get_variables`, `suspend`.
